@@ -1,0 +1,15 @@
+set(CMAKE_HOST_SYSTEM "MSYS-3.6.9-aa532e7b.x86_64")
+set(CMAKE_HOST_SYSTEM_NAME "MSYS")
+set(CMAKE_HOST_SYSTEM_VERSION "3.6.9-aa532e7b.x86_64")
+set(CMAKE_HOST_SYSTEM_PROCESSOR "x86_64")
+
+include("/d/0apelotas/descargas2/ACGC-PS3-Port/ps3/cmake/Toolchain-psl1ght.cmake")
+
+set(CMAKE_SYSTEM "Generic")
+set(CMAKE_SYSTEM_NAME "Generic")
+set(CMAKE_SYSTEM_VERSION "")
+set(CMAKE_SYSTEM_PROCESSOR "ppu")
+
+set(CMAKE_CROSSCOMPILING "TRUE")
+
+set(CMAKE_SYSTEM_LOADED 1)
