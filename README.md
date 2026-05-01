@@ -1,6 +1,30 @@
 # Animal Crossing GC PS3 Port
 <img width="1600" height="900" alt="image" src="https://github.com/user-attachments/assets/eecad8c4-642c-4fe0-a73e-a053c8aa61b4" />
 
+Last update, late 01/05: Current Progress Status
+
+Significant progress has been made.
+
+Previously:
+The game crashed very early during the second frame (JW_EndFrame).
+This indicated a basic engine or render loop issue.
+
+Now:
+System initialization completes.
+Audio initialization completes.
+Initial menu setup completes.
+Memory arena (48 MB) is allocated.
+Filesystem and resources are loading.
+The module /foresta.rel.szs is successfully loaded.
+Execution proceeds into game logic.
+
+Current Failure Point
+
+The crash now occurs after loading the REL module (foresta.rel.szs), during execution of module-related code.
+
+This indicates:
+The core engine is now running correctly.
+The failure is happening in dynamic module handling, not base systems.
 New update 01/05/2026 the game dead in the second frame, but is booting on ps3 real hardware and in the RPCS3 EMU. 
 Work-in-progress PS3 homebrew port of Animal Crossing (GameCube), based on the
 existing decompilation and native port work.
