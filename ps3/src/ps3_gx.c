@@ -1,9 +1,9 @@
-/* ps3_gx.c - first PS3 GX backend.
+/* ps3_gx.c - PS3 GX compatibility backend.
  *
- * This initializes RSX display buffers and provides a conservative software
- * raster fallback for direct GX primitives. It is not a full TEV/texture
- * renderer yet; it is intended to make the full game link/run far enough to
- * validate platform, timing, input, audio and save systems on hardware.
+ * The original renderer emits GameCube GX primitives. On PS3 we keep the GX
+ * contract and rasterize into RSX-backed XRGB buffers in software, then flip
+ * those buffers with the RSX. This gives the port deterministic behaviour on
+ * RPCS3 and hardware while the higher-level game code still uses GX calls.
  */
 #include "ps3_platform.h"
 #include <dolphin/gx.h>
@@ -22,6 +22,9 @@
 #define PS3_GX_MAX_VERTS      8192
 #define PS3_GX_LABEL_INDEX    255
 #define PS3_GX_MAX_MTX        64
+#define PS3_GX_MAX_TEX_MTX    10
+#define PS3_GX_MAX_TLUTS      1024
+#define PS3_GX_MAX_LIGHTS     8
 
 typedef struct {
     int width;
@@ -33,8 +36,12 @@ typedef struct {
 
 typedef struct {
     f32 x, y, z;
+    f32 nx, ny, nz;
     f32 sx, sy, sz;
-    f32 s, t;
+    f32 rw;
+    f32 s[GX_MAX_TEXCOORD];
+    f32 t[GX_MAX_TEXCOORD];
+    u8 has_texcoord[GX_MAX_TEXCOORD];
     u8 r, g, b, a;
 } PS3GxVertex;
 
@@ -48,6 +55,13 @@ typedef struct {
     u32 tlut;
     u8 mipmap;
 } PS3GxTexObj;
+
+typedef struct {
+    uintptr_t lut;
+    u32 format;
+    u16 n_entries;
+    u16 reserved;
+} PS3GxTlutObj;
 
 typedef struct {
     GXTevColorArg color_in[4];
@@ -67,6 +81,8 @@ typedef struct {
     GXChannelID color_chan;
     GXTevKColorSel k_color_sel;
     GXTevKAlphaSel k_alpha_sel;
+    GXTevSwapSel ras_swap;
+    GXTevSwapSel tex_swap;
 } PS3GxTevStage;
 
 typedef struct {
@@ -76,6 +92,32 @@ typedef struct {
     u32 off;
     int overflow;
 } PS3GxDisplayList;
+
+typedef struct {
+    GXBool enable;
+    GXColorSrc amb_src;
+    GXColorSrc mat_src;
+    u32 light_mask;
+    GXDiffuseFn diff_fn;
+    GXAttnFn attn_fn;
+} PS3GxChanCtrl;
+
+typedef struct {
+    GXTexGenType func;
+    GXTexGenSrc src;
+    u32 mtx;
+    u32 postmtx;
+    GXBool normalize;
+    GXBool enabled;
+} PS3GxTexGen;
+
+typedef struct {
+    GXColor color;
+    f32 pos[3];
+    f32 dir[3];
+    f32 attn_a[3];
+    f32 attn_k[3];
+} PS3GxLightObj;
 
 enum {
     PS3GX_DL_OP_TEXCOPY_SRC = 0x1001,
@@ -91,14 +133,24 @@ static PS3GxBuffer s_buffers[2];
 static int s_current_buffer = 0;
 static GXColor s_clear_color = { 0, 0, 0, 0xFF };
 static GXBool s_blend_enable = GX_FALSE;
+static GXBlendMode s_blend_mode = GX_BM_NONE;
+static GXBlendFactor s_blend_src = GX_BL_ONE;
+static GXBlendFactor s_blend_dst = GX_BL_ZERO;
+static GXLogicOp s_logic_op = GX_LO_COPY;
 static GXBool s_color_update = GX_TRUE;
+static GXBool s_alpha_update = GX_TRUE;
+static GXBool s_dst_alpha_enable = GX_FALSE;
+static u8 s_dst_alpha = 0;
 static f32 s_view_left = 0.0f;
 static f32 s_view_top = 0.0f;
 static f32 s_view_w = PS3_SCREEN_WIDTH;
 static f32 s_view_h = PS3_SCREEN_HEIGHT;
 static f32 s_projection[16];
 static int s_projection_valid = 0;
+static GXProjectionType s_projection_type = GX_ORTHOGRAPHIC;
 static f32 s_pos_mtx[PS3_GX_MAX_MTX][12];
+static f32 s_tex_mtx[PS3_GX_MAX_TEX_MTX][12];
+static GXTexMtxType s_tex_mtx_type[PS3_GX_MAX_TEX_MTX];
 static u32 s_current_mtx = 0;
 static const void* s_array_base[GX_VA_MAX_ATTR];
 static u8 s_array_stride[GX_VA_MAX_ATTR];
@@ -110,9 +162,13 @@ static PS3GxVertex s_current_vertex;
 static PS3GxVertex s_vertices[PS3_GX_MAX_VERTS];
 static int s_vertex_count = 0;
 static PS3GxTexObj s_texmaps[GX_MAX_TEXMAP];
+static PS3GxTlutObj s_tluts[PS3_GX_MAX_TLUTS];
 static GXTexMapID s_active_texmap = GX_TEXMAP_NULL;
+static PS3GxTexGen s_tex_gens[GX_MAX_TEXCOORD];
+static u8 s_num_tex_gens = 0;
 static PS3GxTevStage s_tev_stages[GX_MAX_TEVSTAGE];
 static u8 s_num_tev_stages = 1;
+static u8 s_tev_swap_table[GX_MAX_TEVSWAP][4];
 static GXColor s_tev_regs[GX_MAX_TEVREG] = {
     { 255, 255, 255, 255 },
     { 255, 255, 255, 255 },
@@ -132,6 +188,7 @@ static GXDrawDoneCallback s_draw_done_cb = NULL;
 static GXBreakPtCallback s_breakpt_cb = NULL;
 static u16 s_draw_token = 0;
 static float* s_z_buffer = NULL;
+static u8* s_alpha_buffer = NULL;
 static float s_clear_z = 1.0f;
 static GXBool s_z_compare_enable = GX_FALSE;
 static GXCompare s_z_func = GX_LEQUAL;
@@ -143,6 +200,15 @@ static u16 s_tex_copy_dst_w = PS3_SCREEN_WIDTH;
 static u16 s_tex_copy_dst_h = PS3_SCREEN_HEIGHT;
 static GXTexFmt s_tex_copy_fmt = GX_TF_RGB565;
 static GXBool s_tex_copy_mipmap = GX_FALSE;
+static u16 s_disp_copy_src[4] = { 0, 0, PS3_SCREEN_WIDTH, PS3_SCREEN_HEIGHT };
+static u16 s_disp_copy_dst_w = PS3_SCREEN_WIDTH;
+static u16 s_disp_copy_dst_h = PS3_SCREEN_HEIGHT;
+static s32 s_scissor_left = 0;
+static s32 s_scissor_top = 0;
+static s32 s_scissor_right = PS3_SCREEN_WIDTH - 1;
+static s32 s_scissor_bottom = PS3_SCREEN_HEIGHT - 1;
+static u8 s_line_width = 1;
+static u8 s_point_size = 1;
 static GXCompare s_alpha_comp0 = GX_ALWAYS;
 static GXCompare s_alpha_comp1 = GX_ALWAYS;
 static GXAlphaOp s_alpha_op = GX_AOP_AND;
@@ -153,6 +219,13 @@ static f32 s_fog_start = 0.0f;
 static f32 s_fog_end = 1.0f;
 static GXColor s_fog_color = { 0, 0, 0, 255 };
 static GXCullMode s_cull_mode = GX_CULL_NONE;
+static u8 s_num_chans = 0;
+static PS3GxChanCtrl s_chan_ctrl[2];
+static PS3GxChanCtrl s_alpha_chan_ctrl[2];
+static GXColor s_chan_amb_color[2];
+static GXColor s_chan_mat_color[2];
+static PS3GxLightObj s_lights[PS3_GX_MAX_LIGHTS];
+static u8 s_light_loaded[PS3_GX_MAX_LIGHTS];
 
 #if defined(TARGET_PS3)
 static gcmContextData* s_rsx_context = NULL;
@@ -221,11 +294,149 @@ static float gx_clamp01(float v) {
     return v;
 }
 
+static void gx_normalize3(float* x, float* y, float* z) {
+    float len = sqrtf((*x * *x) + (*y * *y) + (*z * *z));
+    if (len > 0.000001f) {
+        float inv = 1.0f / len;
+        *x *= inv;
+        *y *= inv;
+        *z *= inv;
+    }
+}
+
+static int gx_tex_mtx_index(u32 id) {
+    if (id >= GX_TEXMTX0 && id <= GX_TEXMTX9 && ((id - GX_TEXMTX0) % 3u) == 0u) {
+        return (int)((id - GX_TEXMTX0) / 3u);
+    }
+    return -1;
+}
+
+static int gx_chan_index(GXChannelID chan) {
+    switch (chan) {
+        case GX_COLOR1:
+        case GX_ALPHA1:
+        case GX_COLOR1A1:
+            return 1;
+        case GX_COLOR0:
+        case GX_ALPHA0:
+        case GX_COLOR0A0:
+        default:
+            return 0;
+    }
+}
+
+static void gx_default_vertex_color(GXColor* color) {
+    if (s_chan_ctrl[0].mat_src == GX_SRC_REG) {
+        *color = s_chan_mat_color[0];
+    } else {
+        color->r = 255;
+        color->g = 255;
+        color->b = 255;
+        color->a = 255;
+    }
+}
+
+static void gx_reset_current_vertex(void) {
+    GXColor color;
+    memset(&s_current_vertex, 0, sizeof(s_current_vertex));
+    s_current_vertex.nz = 1.0f;
+    s_current_vertex.rw = 1.0f;
+    gx_default_vertex_color(&color);
+    s_current_vertex.r = color.r;
+    s_current_vertex.g = color.g;
+    s_current_vertex.b = color.b;
+    s_current_vertex.a = color.a;
+}
+
+static int gx_next_texcoord_slot(void) {
+    int limit = s_num_tex_gens ? s_num_tex_gens : GX_MAX_TEXCOORD;
+    if (limit > GX_MAX_TEXCOORD) {
+        limit = GX_MAX_TEXCOORD;
+    }
+    for (int i = 0; i < limit; i++) {
+        if (!s_current_vertex.has_texcoord[i]) {
+            return i;
+        }
+    }
+    return 0;
+}
+
 static void decode_rgb565(u16 px, GXColor* color) {
     color->r = expand5((px >> 11) & 0x1F);
     color->g = expand6((px >> 5) & 0x3F);
     color->b = expand5(px & 0x1F);
     color->a = 255;
+}
+
+static void decode_rgb5a3(u16 px, GXColor* color) {
+    if (px & 0x8000) {
+        color->a = 255;
+        color->r = expand5((px >> 10) & 0x1F);
+        color->g = expand5((px >> 5) & 0x1F);
+        color->b = expand5(px & 0x1F);
+    } else {
+        color->a = (u8)((((px >> 12) & 0x7) * 255) / 7);
+        color->r = expand4((px >> 8) & 0x0F);
+        color->g = expand4((px >> 4) & 0x0F);
+        color->b = expand4(px & 0x0F);
+    }
+}
+
+static void decode_tlut_entry(const PS3GxTlutObj* tlut, u32 index, GXColor* color) {
+    const u8* lut;
+    u16 px;
+
+    if (!tlut || !tlut->lut || !tlut->n_entries || index >= tlut->n_entries) {
+        u8 v = (u8)index;
+        color->r = color->g = color->b = v;
+        color->a = 255;
+        return;
+    }
+
+    lut = (const u8*)(uintptr_t)tlut->lut;
+    px = read_be16(lut + index * 2u);
+    switch ((GXTlutFmt)tlut->format) {
+        case GX_TL_IA8:
+            color->r = color->g = color->b = (u8)(px >> 8);
+            color->a = (u8)px;
+            break;
+        case GX_TL_RGB565:
+            decode_rgb565(px, color);
+            break;
+        case GX_TL_RGB5A3:
+        default:
+            decode_rgb5a3(px, color);
+            break;
+    }
+}
+
+static void sample_ci_texel(const PS3GxTexObj* tex, const u8* image, u32 x, u32 y, GXColor* color) {
+    u32 offset;
+    u32 index = 0;
+    const PS3GxTlutObj* tlut = tex->tlut < PS3_GX_MAX_TLUTS ? &s_tluts[tex->tlut] : NULL;
+
+    switch ((GXCITexFmt)tex->format) {
+        case GX_TF_C4: {
+            offset = gx_tiled_block_offset(x, y, tex->width, 8, 8, 32) + (y & 7u) * 4u + ((x & 7u) >> 1);
+            u8 b = image[offset];
+            index = (x & 1u) ? (b & 0x0F) : (b >> 4);
+            break;
+        }
+        case GX_TF_C8:
+            offset = gx_tiled_block_offset(x, y, tex->width, 8, 4, 32) + (y & 3u) * 8u + (x & 7u);
+            index = image[offset];
+            break;
+        case GX_TF_C14X2:
+            offset = gx_tiled_block_offset(x, y, tex->width, 4, 4, 32) + (y & 3u) * 8u + (x & 3u) * 2u;
+            index = read_be16(image + offset) & 0x3FFFu;
+            break;
+        default:
+            color->r = color->g = color->b = 255;
+            color->a = 255;
+            return;
+    }
+
+    decode_tlut_entry(tlut, index, color);
 }
 
 static void sample_cmpr_texel(const u8* image, u32 width, u32 x, u32 y, GXColor* color) {
@@ -280,7 +491,7 @@ static void sample_texel(const PS3GxTexObj* tex, float s, float t, GXColor* colo
     ux = (u32)x;
     uy = (u32)y;
 
-    switch ((GXTexFmt)tex->format) {
+    switch (tex->format) {
         case GX_TF_I4: {
             offset = gx_tiled_block_offset(ux, uy, tex->width, 8, 8, 32) + (uy & 7u) * 4u + ((ux & 7u) >> 1);
             u8 b = image[offset];
@@ -318,18 +529,7 @@ static void sample_texel(const PS3GxTexObj* tex, float s, float t, GXColor* colo
         }
         case GX_TF_RGB5A3: {
             offset = gx_tiled_block_offset(ux, uy, tex->width, 4, 4, 32) + (uy & 3u) * 8u + (ux & 3u) * 2u;
-            u16 px = read_be16(image + offset);
-            if (px & 0x8000) {
-                color->a = 255;
-                color->r = expand5((px >> 10) & 0x1F);
-                color->g = expand5((px >> 5) & 0x1F);
-                color->b = expand5(px & 0x1F);
-            } else {
-                color->a = (u8)((((px >> 12) & 0x7) * 255) / 7);
-                color->r = expand4((px >> 8) & 0x0F);
-                color->g = expand4((px >> 4) & 0x0F);
-                color->b = expand4(px & 0x0F);
-            }
+            decode_rgb5a3(read_be16(image + offset), color);
             break;
         }
         case GX_TF_RGBA8:
@@ -343,6 +543,11 @@ static void sample_texel(const PS3GxTexObj* tex, float s, float t, GXColor* colo
         }
         case GX_TF_CMPR:
             sample_cmpr_texel(image, tex->width, ux, uy, color);
+            break;
+        case GX_TF_C4:
+        case GX_TF_C8:
+        case GX_TF_C14X2:
+            sample_ci_texel(tex, image, ux, uy, color);
             break;
         case GX_TF_A8: {
             offset = gx_tiled_block_offset(ux, uy, tex->width, 8, 4, 32) + (uy & 3u) * 8u + (ux & 7u);
@@ -362,24 +567,37 @@ static void gx_color_to_float(GXColor c, float out[4]) {
     out[3] = (float)c.a / 255.0f;
 }
 
-static GXColor gx_float_to_color(const float v[4]) {
-    GXColor out;
-    out.r = gx_clamp_u8(v[0] * 255.0f);
-    out.g = gx_clamp_u8(v[1] * 255.0f);
-    out.b = gx_clamp_u8(v[2] * 255.0f);
-    out.a = gx_clamp_u8(v[3] * 255.0f);
-    return out;
+static void gx_apply_tev_swap(GXTevSwapSel sel, const float in[4], float out[4]) {
+    const u8* table;
+    float src[4];
+    if (sel >= GX_MAX_TEVSWAP) {
+        sel = GX_TEV_SWAP0;
+    }
+    memcpy(src, in, sizeof(src));
+    table = s_tev_swap_table[sel];
+    out[0] = src[table[0] & 3u];
+    out[1] = src[table[1] & 3u];
+    out[2] = src[table[2] & 3u];
+    out[3] = src[table[3] & 3u];
 }
 
-static void gx_sample_stage_texture(const PS3GxTevStage* stage, float s, float t, float out[4]) {
+static void gx_sample_stage_texture(const PS3GxTevStage* stage, const float s[GX_MAX_TEXCOORD],
+                                    const float t[GX_MAX_TEXCOORD], float out[4]) {
     GXColor texel = { 255, 255, 255, 255 };
     GXTexMapID map = stage->tex_map;
+    GXTexCoordID coord = stage->tex_coord;
+    float ts = s[0];
+    float tt = t[0];
 
     if (map == GX_TEXMAP_NULL || map == GX_TEX_DISABLE) {
         map = s_active_texmap;
     }
+    if (coord < GX_MAX_TEXCOORD) {
+        ts = s[coord];
+        tt = t[coord];
+    }
     if (map < GX_MAX_TEXMAP) {
-        sample_texel(&s_texmaps[map], s, t, &texel);
+        sample_texel(&s_texmaps[map], ts, tt, &texel);
     }
     gx_color_to_float(texel, out);
 }
@@ -494,10 +712,77 @@ static float gx_tev_apply_op(float a, float b, float c, float d, GXTevOp op, GXT
     return clamp ? gx_clamp01(out) : out;
 }
 
-static void apply_tev(float s, float t, float z, u8* r, u8* g, u8* b, u8* a) {
+static u32 gx_tev_cmp_pack8(float v) {
+    return (u32)gx_clamp_u8(gx_clamp01(v) * 255.0f);
+}
+
+static void gx_tev_apply_color_op_vec(const float a[3], const float b[3], const float c[3], const float d[3],
+                                      GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool clamp, float out[3]) {
+    int cmp;
+
+    switch (op) {
+        case GX_TEV_COMP_R8_GT:
+            cmp = gx_tev_cmp_pack8(a[0]) > gx_tev_cmp_pack8(b[0]);
+            for (int ch = 0; ch < 3; ch++) out[ch] = clamp ? gx_clamp01(d[ch] + (cmp ? c[ch] : 0.0f)) : d[ch] + (cmp ? c[ch] : 0.0f);
+            return;
+        case GX_TEV_COMP_R8_EQ:
+            cmp = gx_tev_cmp_pack8(a[0]) == gx_tev_cmp_pack8(b[0]);
+            for (int ch = 0; ch < 3; ch++) out[ch] = clamp ? gx_clamp01(d[ch] + (cmp ? c[ch] : 0.0f)) : d[ch] + (cmp ? c[ch] : 0.0f);
+            return;
+        case GX_TEV_COMP_GR16_GT: {
+            u32 av = (gx_tev_cmp_pack8(a[0]) << 8) | gx_tev_cmp_pack8(a[1]);
+            u32 bv = (gx_tev_cmp_pack8(b[0]) << 8) | gx_tev_cmp_pack8(b[1]);
+            cmp = av > bv;
+            for (int ch = 0; ch < 3; ch++) out[ch] = clamp ? gx_clamp01(d[ch] + (cmp ? c[ch] : 0.0f)) : d[ch] + (cmp ? c[ch] : 0.0f);
+            return;
+        }
+        case GX_TEV_COMP_GR16_EQ: {
+            u32 av = (gx_tev_cmp_pack8(a[0]) << 8) | gx_tev_cmp_pack8(a[1]);
+            u32 bv = (gx_tev_cmp_pack8(b[0]) << 8) | gx_tev_cmp_pack8(b[1]);
+            cmp = av == bv;
+            for (int ch = 0; ch < 3; ch++) out[ch] = clamp ? gx_clamp01(d[ch] + (cmp ? c[ch] : 0.0f)) : d[ch] + (cmp ? c[ch] : 0.0f);
+            return;
+        }
+        case GX_TEV_COMP_BGR24_GT: {
+            u32 av = (gx_tev_cmp_pack8(a[2]) << 16) | (gx_tev_cmp_pack8(a[1]) << 8) | gx_tev_cmp_pack8(a[0]);
+            u32 bv = (gx_tev_cmp_pack8(b[2]) << 16) | (gx_tev_cmp_pack8(b[1]) << 8) | gx_tev_cmp_pack8(b[0]);
+            cmp = av > bv;
+            for (int ch = 0; ch < 3; ch++) out[ch] = clamp ? gx_clamp01(d[ch] + (cmp ? c[ch] : 0.0f)) : d[ch] + (cmp ? c[ch] : 0.0f);
+            return;
+        }
+        case GX_TEV_COMP_BGR24_EQ: {
+            u32 av = (gx_tev_cmp_pack8(a[2]) << 16) | (gx_tev_cmp_pack8(a[1]) << 8) | gx_tev_cmp_pack8(a[0]);
+            u32 bv = (gx_tev_cmp_pack8(b[2]) << 16) | (gx_tev_cmp_pack8(b[1]) << 8) | gx_tev_cmp_pack8(b[0]);
+            cmp = av == bv;
+            for (int ch = 0; ch < 3; ch++) out[ch] = clamp ? gx_clamp01(d[ch] + (cmp ? c[ch] : 0.0f)) : d[ch] + (cmp ? c[ch] : 0.0f);
+            return;
+        }
+        case GX_TEV_COMP_RGB8_GT:
+            for (int ch = 0; ch < 3; ch++) {
+                cmp = gx_tev_cmp_pack8(a[ch]) > gx_tev_cmp_pack8(b[ch]);
+                out[ch] = clamp ? gx_clamp01(d[ch] + (cmp ? c[ch] : 0.0f)) : d[ch] + (cmp ? c[ch] : 0.0f);
+            }
+            return;
+        case GX_TEV_COMP_RGB8_EQ:
+            for (int ch = 0; ch < 3; ch++) {
+                cmp = gx_tev_cmp_pack8(a[ch]) == gx_tev_cmp_pack8(b[ch]);
+                out[ch] = clamp ? gx_clamp01(d[ch] + (cmp ? c[ch] : 0.0f)) : d[ch] + (cmp ? c[ch] : 0.0f);
+            }
+            return;
+        default:
+            for (int ch = 0; ch < 3; ch++) {
+                out[ch] = gx_tev_apply_op(a[ch], b[ch], c[ch], d[ch], op, bias, scale, clamp);
+            }
+            return;
+    }
+}
+
+static void apply_tev(const float s[GX_MAX_TEXCOORD], const float t[GX_MAX_TEXCOORD],
+                      float z, u8* r, u8* g, u8* b, u8* a) {
     float prev[4];
     float regs[GX_MAX_TEVREG][4];
     float ras[4];
+    float ras_stage[4];
     int stages = s_num_tev_stages;
     GXColor ras_color = { *r, *g, *b, *a };
 
@@ -515,32 +800,36 @@ static void apply_tev(float s, float t, float z, u8* r, u8* g, u8* b, u8* a) {
         float konst[4];
         float next[4] = { prev[0], prev[1], prev[2], prev[3] };
         gx_sample_stage_texture(st, s, t, tex);
+        gx_apply_tev_swap(st->tex_swap, tex, tex);
+        gx_apply_tev_swap(st->ras_swap, ras, ras_stage);
         gx_select_konst_color(st->k_color_sel, konst);
 
-        for (int ch = 0; ch < 3; ch++) {
-            float av = gx_tev_color_arg(st->color_in[0], ch, prev, regs, tex, ras, konst);
-            float bv = gx_tev_color_arg(st->color_in[1], ch, prev, regs, tex, ras, konst);
-            float cv = gx_tev_color_arg(st->color_in[2], ch, prev, regs, tex, ras, konst);
-            float dv = gx_tev_color_arg(st->color_in[3], ch, prev, regs, tex, ras, konst);
-            next[ch] = gx_tev_apply_op(av, bv, cv, dv, st->color_op, st->color_bias, st->color_scale, st->color_clamp);
+        {
+            float av[3], bv[3], cv[3], dv[3];
+            for (int ch = 0; ch < 3; ch++) {
+                av[ch] = gx_tev_color_arg(st->color_in[0], ch, prev, regs, tex, ras_stage, konst);
+                bv[ch] = gx_tev_color_arg(st->color_in[1], ch, prev, regs, tex, ras_stage, konst);
+                cv[ch] = gx_tev_color_arg(st->color_in[2], ch, prev, regs, tex, ras_stage, konst);
+                dv[ch] = gx_tev_color_arg(st->color_in[3], ch, prev, regs, tex, ras_stage, konst);
+            }
+            gx_tev_apply_color_op_vec(av, bv, cv, dv, st->color_op, st->color_bias, st->color_scale, st->color_clamp, next);
         }
         {
             float ka = gx_select_konst_alpha(st->k_alpha_sel);
-            float av = gx_tev_alpha_arg(st->alpha_in[0], prev, regs, tex, ras, ka);
-            float bv = gx_tev_alpha_arg(st->alpha_in[1], prev, regs, tex, ras, ka);
-            float cv = gx_tev_alpha_arg(st->alpha_in[2], prev, regs, tex, ras, ka);
-            float dv = gx_tev_alpha_arg(st->alpha_in[3], prev, regs, tex, ras, ka);
+            float av = gx_tev_alpha_arg(st->alpha_in[0], prev, regs, tex, ras_stage, ka);
+            float bv = gx_tev_alpha_arg(st->alpha_in[1], prev, regs, tex, ras_stage, ka);
+            float cv = gx_tev_alpha_arg(st->alpha_in[2], prev, regs, tex, ras_stage, ka);
+            float dv = gx_tev_alpha_arg(st->alpha_in[3], prev, regs, tex, ras_stage, ka);
             next[3] = gx_tev_apply_op(av, bv, cv, dv, st->alpha_op, st->alpha_bias, st->alpha_scale, st->alpha_clamp);
         }
 
         if (st->color_out < GX_MAX_TEVREG) {
-            GXColor tmp = gx_float_to_color(next);
-            s_tev_regs[st->color_out].r = tmp.r;
-            s_tev_regs[st->color_out].g = tmp.g;
-            s_tev_regs[st->color_out].b = tmp.b;
+            regs[st->color_out][0] = next[0];
+            regs[st->color_out][1] = next[1];
+            regs[st->color_out][2] = next[2];
         }
         if (st->alpha_out < GX_MAX_TEVREG) {
-            s_tev_regs[st->alpha_out].a = gx_clamp_u8(next[3] * 255.0f);
+            regs[st->alpha_out][3] = next[3];
         }
         memcpy(prev, next, sizeof(prev));
     }
@@ -572,14 +861,22 @@ static void gx_set_defaults(void) {
     for (i = 0; i < PS3_GX_MAX_MTX; i++) {
         gx_identity_mtx(s_pos_mtx[i]);
     }
+    for (i = 0; i < PS3_GX_MAX_TEX_MTX; i++) {
+        gx_identity_mtx(s_tex_mtx[i]);
+        s_tex_mtx_type[i] = GX_MTX3x4;
+    }
     memset(s_projection, 0, sizeof(s_projection));
     s_projection[0] = 1.0f;
     s_projection[5] = 1.0f;
     s_projection[10] = 1.0f;
     s_projection[15] = 1.0f;
     s_projection_valid = 0;
+    s_projection_type = GX_ORTHOGRAPHIC;
     memset(s_texmaps, 0, sizeof(s_texmaps));
+    memset(s_tluts, 0, sizeof(s_tluts));
     s_active_texmap = GX_TEXMAP_NULL;
+    memset(s_tex_gens, 0, sizeof(s_tex_gens));
+    s_num_tex_gens = 0;
     for (i = 0; i < GX_MAX_TEVSTAGE; i++) {
         PS3GxTevStage* st = &s_tev_stages[i];
         memset(st, 0, sizeof(*st));
@@ -606,7 +903,25 @@ static void gx_set_defaults(void) {
         st->color_chan = GX_COLOR_NULL;
         st->k_color_sel = GX_TEV_KCSEL_1;
         st->k_alpha_sel = GX_TEV_KASEL_1;
+        st->ras_swap = GX_TEV_SWAP0;
+        st->tex_swap = GX_TEV_SWAP0;
     }
+    s_tev_swap_table[GX_TEV_SWAP0][0] = GX_CH_RED;
+    s_tev_swap_table[GX_TEV_SWAP0][1] = GX_CH_GREEN;
+    s_tev_swap_table[GX_TEV_SWAP0][2] = GX_CH_BLUE;
+    s_tev_swap_table[GX_TEV_SWAP0][3] = GX_CH_ALPHA;
+    s_tev_swap_table[GX_TEV_SWAP1][0] = GX_CH_RED;
+    s_tev_swap_table[GX_TEV_SWAP1][1] = GX_CH_RED;
+    s_tev_swap_table[GX_TEV_SWAP1][2] = GX_CH_RED;
+    s_tev_swap_table[GX_TEV_SWAP1][3] = GX_CH_ALPHA;
+    s_tev_swap_table[GX_TEV_SWAP2][0] = GX_CH_GREEN;
+    s_tev_swap_table[GX_TEV_SWAP2][1] = GX_CH_GREEN;
+    s_tev_swap_table[GX_TEV_SWAP2][2] = GX_CH_GREEN;
+    s_tev_swap_table[GX_TEV_SWAP2][3] = GX_CH_ALPHA;
+    s_tev_swap_table[GX_TEV_SWAP3][0] = GX_CH_BLUE;
+    s_tev_swap_table[GX_TEV_SWAP3][1] = GX_CH_BLUE;
+    s_tev_swap_table[GX_TEV_SWAP3][2] = GX_CH_BLUE;
+    s_tev_swap_table[GX_TEV_SWAP3][3] = GX_CH_ALPHA;
     s_num_tev_stages = 1;
     for (i = 0; i < GX_MAX_TEVREG; i++) {
         s_tev_regs[i].r = 255;
@@ -620,10 +935,36 @@ static void gx_set_defaults(void) {
         s_k_colors[i].b = 255;
         s_k_colors[i].a = 255;
     }
-    s_current_vertex.r = 255;
-    s_current_vertex.g = 255;
-    s_current_vertex.b = 255;
-    s_current_vertex.a = 255;
+    s_num_chans = 0;
+    for (i = 0; i < 2; i++) {
+        s_chan_ctrl[i].enable = GX_FALSE;
+        s_chan_ctrl[i].amb_src = GX_SRC_REG;
+        s_chan_ctrl[i].mat_src = GX_SRC_VTX;
+        s_chan_ctrl[i].light_mask = GX_LIGHT_NULL;
+        s_chan_ctrl[i].diff_fn = GX_DF_NONE;
+        s_chan_ctrl[i].attn_fn = GX_AF_NONE;
+        s_alpha_chan_ctrl[i] = s_chan_ctrl[i];
+        s_chan_amb_color[i].r = 0;
+        s_chan_amb_color[i].g = 0;
+        s_chan_amb_color[i].b = 0;
+        s_chan_amb_color[i].a = 255;
+        s_chan_mat_color[i].r = 255;
+        s_chan_mat_color[i].g = 255;
+        s_chan_mat_color[i].b = 255;
+        s_chan_mat_color[i].a = 255;
+    }
+    memset(s_lights, 0, sizeof(s_lights));
+    memset(s_light_loaded, 0, sizeof(s_light_loaded));
+    gx_reset_current_vertex();
+    s_blend_enable = GX_FALSE;
+    s_blend_mode = GX_BM_NONE;
+    s_blend_src = GX_BL_ONE;
+    s_blend_dst = GX_BL_ZERO;
+    s_logic_op = GX_LO_COPY;
+    s_color_update = GX_TRUE;
+    s_alpha_update = GX_TRUE;
+    s_dst_alpha_enable = GX_FALSE;
+    s_dst_alpha = 0;
     s_z_compare_enable = GX_FALSE;
     s_z_func = GX_LEQUAL;
     s_z_update_enable = GX_FALSE;
@@ -641,6 +982,24 @@ static void gx_set_defaults(void) {
     s_fog_color.r = s_fog_color.g = s_fog_color.b = 0;
     s_fog_color.a = 255;
     s_cull_mode = GX_CULL_NONE;
+    s_scissor_left = 0;
+    s_scissor_top = 0;
+    s_scissor_right = (s32)s_screen_w - 1;
+    s_scissor_bottom = (s32)s_screen_h - 1;
+    s_line_width = 1;
+    s_point_size = 1;
+    s_tex_copy_src[0] = 0;
+    s_tex_copy_src[1] = 0;
+    s_tex_copy_src[2] = s_screen_w;
+    s_tex_copy_src[3] = s_screen_h;
+    s_tex_copy_dst_w = s_screen_w;
+    s_tex_copy_dst_h = s_screen_h;
+    s_disp_copy_src[0] = 0;
+    s_disp_copy_src[1] = 0;
+    s_disp_copy_src[2] = s_screen_w;
+    s_disp_copy_src[3] = s_screen_h;
+    s_disp_copy_dst_w = s_screen_w;
+    s_disp_copy_dst_h = s_screen_h;
 }
 
 static u32* gx_framebuffer(void) {
@@ -664,29 +1023,108 @@ static void gx_clear_framebuffer(void) {
             s_z_buffer[i] = s_clear_z;
         }
     }
+    if (s_alpha_buffer) {
+        memset(s_alpha_buffer, s_clear_color.a, pixels);
+    }
+}
+
+static int gx_in_scissor(int x, int y) {
+    return x >= s_scissor_left && x <= s_scissor_right &&
+           y >= s_scissor_top && y <= s_scissor_bottom;
+}
+
+static u32 gx_logic_apply(u32 src, u32 dst) {
+    switch (s_logic_op) {
+        case GX_LO_CLEAR: return 0;
+        case GX_LO_AND: return src & dst;
+        case GX_LO_REVAND: return src & ~dst;
+        case GX_LO_INVAND: return ~src & dst;
+        case GX_LO_NOOP: return dst;
+        case GX_LO_XOR: return src ^ dst;
+        case GX_LO_OR: return src | dst;
+        case GX_LO_NOR: return ~(src | dst);
+        case GX_LO_EQUIV: return ~(src ^ dst);
+        case GX_LO_INV: return ~dst;
+        case GX_LO_REVOR: return src | ~dst;
+        case GX_LO_INVCOPY: return ~src;
+        case GX_LO_INVOR: return ~src | dst;
+        case GX_LO_NAND: return ~(src & dst);
+        case GX_LO_SET: return 0x00FFFFFFu;
+        case GX_LO_COPY:
+        default:
+            return src;
+    }
+}
+
+static float gx_blend_factor(GXBlendFactor factor, int for_src, u8 src_c, u8 dst_c, u8 src_a, u8 dst_a) {
+    switch (factor) {
+        case GX_BL_ZERO:
+            return 0.0f;
+        case GX_BL_ONE:
+            return 1.0f;
+        case GX_BL_SRCCLR:
+            return (float)(for_src ? dst_c : src_c) / 255.0f;
+        case GX_BL_INVSRCCLR:
+            return 1.0f - ((float)(for_src ? dst_c : src_c) / 255.0f);
+        case GX_BL_SRCALPHA:
+            return (float)src_a / 255.0f;
+        case GX_BL_INVSRCALPHA:
+            return 1.0f - ((float)src_a / 255.0f);
+        case GX_BL_DSTALPHA:
+            return (float)dst_a / 255.0f;
+        case GX_BL_INVDSTALPHA:
+            return 1.0f - ((float)dst_a / 255.0f);
+        default:
+            return 1.0f;
+    }
+}
+
+static u8 gx_blend_channel(u8 src, u8 dst, u8 src_a, u8 dst_a) {
+    float sf = gx_blend_factor(s_blend_src, 1, src, dst, src_a, dst_a);
+    float df = gx_blend_factor(s_blend_dst, 0, src, dst, src_a, dst_a);
+    return gx_clamp_u8((float)src * sf + (float)dst * df);
 }
 
 static void gx_plot(int x, int y, u8 r, u8 g, u8 b, u8 a) {
     u32* fb = gx_framebuffer();
     u32* dst;
-    u32 dc, dr, dg, db;
+    u32 idx;
+    u32 dc, dr, dg, db, da;
+    u32 src;
 
-    if (!fb || !s_color_update) return;
+    if ((!fb || !s_color_update) && (!s_alpha_buffer || !s_alpha_update)) return;
     if (x < 0 || y < 0 || x >= (int)s_screen_w || y >= (int)s_screen_h) return;
+    if (!gx_in_scissor(x, y)) return;
 
-    dst = &fb[(u32)y * s_screen_w + (u32)x];
-    if (!s_blend_enable || a == 255) {
-        *dst = pack_xrgb(r, g, b);
-        return;
+    idx = (u32)y * s_screen_w + (u32)x;
+    if (fb && s_color_update) {
+        dst = &fb[idx];
+        src = pack_xrgb(r, g, b);
+        if (!s_blend_enable || s_blend_mode == GX_BM_NONE) {
+            *dst = src;
+        } else {
+            dc = *dst;
+            dr = (dc >> 16) & 0xFF;
+            dg = (dc >> 8) & 0xFF;
+            db = dc & 0xFF;
+            da = s_alpha_buffer ? s_alpha_buffer[idx] : 255;
+
+            if (s_blend_mode == GX_BM_LOGIC) {
+                *dst = gx_logic_apply(src, dc) & 0x00FFFFFFu;
+            } else if (s_blend_mode == GX_BM_SUBTRACT) {
+                *dst = pack_xrgb(gx_clamp_u8((float)dr - (float)r),
+                                 gx_clamp_u8((float)dg - (float)g),
+                                 gx_clamp_u8((float)db - (float)b));
+            } else {
+                *dst = pack_xrgb(gx_blend_channel(r, (u8)dr, a, (u8)da),
+                                 gx_blend_channel(g, (u8)dg, a, (u8)da),
+                                 gx_blend_channel(b, (u8)db, a, (u8)da));
+            }
+        }
     }
-
-    dc = *dst;
-    dr = (dc >> 16) & 0xFF;
-    dg = (dc >> 8) & 0xFF;
-    db = dc & 0xFF;
-    *dst = pack_xrgb((u8)((r * a + dr * (255 - a)) / 255),
-                     (u8)((g * a + dg * (255 - a)) / 255),
-                     (u8)((b * a + db * (255 - a)) / 255));
+    if (s_alpha_update && s_alpha_buffer) {
+        s_alpha_buffer[idx] = s_dst_alpha_enable ? s_dst_alpha : a;
+    }
 }
 
 static int gx_depth_compare(float z, float current) {
@@ -740,6 +1178,9 @@ static int gx_depth_test_at(int x, int y, float z) {
     if (x < 0 || y < 0 || x >= (int)s_screen_w || y >= (int)s_screen_h) {
         return 0;
     }
+    if (!gx_in_scissor(x, y)) {
+        return 0;
+    }
     idx = (u32)y * s_screen_w + (u32)x;
     if (s_z_compare_enable && !gx_depth_compare(z, s_z_buffer[idx])) {
         return 0;
@@ -756,11 +1197,180 @@ static void gx_plot_depth(int x, int y, float z, u8 r, u8 g, u8 b, u8 a) {
     }
 }
 
+static void gx_plot_square_depth(int x, int y, int radius, float z, u8 r, u8 g, u8 b, u8 a) {
+    for (int py = y - radius; py <= y + radius; py++) {
+        for (int px = x - radius; px <= x + radius; px++) {
+            gx_plot_depth(px, py, z, r, g, b, a);
+        }
+    }
+}
+
+static void gx_apply_lighting(PS3GxVertex* v) {
+    const PS3GxChanCtrl* ctrl = &s_chan_ctrl[0];
+    GXColor base = { v->r, v->g, v->b, v->a };
+    u8 out_alpha = (s_alpha_chan_ctrl[0].mat_src == GX_SRC_REG) ? s_chan_mat_color[0].a : v->a;
+    float lr, lg, lb;
+    float nx, ny, nz;
+
+    if (ctrl->mat_src == GX_SRC_REG) {
+        base = s_chan_mat_color[0];
+    }
+    if (!ctrl->enable || ctrl->light_mask == GX_LIGHT_NULL) {
+        v->r = base.r;
+        v->g = base.g;
+        v->b = base.b;
+        v->a = out_alpha;
+        return;
+    }
+
+    lr = (float)((ctrl->amb_src == GX_SRC_REG) ? s_chan_amb_color[0].r : v->r) / 255.0f;
+    lg = (float)((ctrl->amb_src == GX_SRC_REG) ? s_chan_amb_color[0].g : v->g) / 255.0f;
+    lb = (float)((ctrl->amb_src == GX_SRC_REG) ? s_chan_amb_color[0].b : v->b) / 255.0f;
+
+    nx = v->nx;
+    ny = v->ny;
+    nz = v->nz;
+    gx_normalize3(&nx, &ny, &nz);
+
+    for (int i = 0; i < PS3_GX_MAX_LIGHTS; i++) {
+        float lx, ly, lz, dot;
+        const PS3GxLightObj* light;
+        if (!(ctrl->light_mask & (1u << i)) || !s_light_loaded[i]) {
+            continue;
+        }
+        light = &s_lights[i];
+        if (ctrl->attn_fn == GX_AF_NONE) {
+            lx = -light->dir[0];
+            ly = -light->dir[1];
+            lz = -light->dir[2];
+            if (fabsf(lx) + fabsf(ly) + fabsf(lz) < 0.000001f) {
+                lx = light->pos[0];
+                ly = light->pos[1];
+                lz = light->pos[2];
+            }
+        } else {
+            lx = light->pos[0] - v->x;
+            ly = light->pos[1] - v->y;
+            lz = light->pos[2] - v->z;
+        }
+        gx_normalize3(&lx, &ly, &lz);
+        dot = nx * lx + ny * ly + nz * lz;
+        if (ctrl->diff_fn == GX_DF_CLAMP && dot < 0.0f) {
+            dot = 0.0f;
+        } else if (ctrl->diff_fn == GX_DF_NONE) {
+            dot = 1.0f;
+        }
+        if (dot > 0.0f) {
+            lr += dot * ((float)light->color.r / 255.0f);
+            lg += dot * ((float)light->color.g / 255.0f);
+            lb += dot * ((float)light->color.b / 255.0f);
+        }
+    }
+
+    v->r = gx_clamp_u8((float)base.r * gx_clamp01(lr));
+    v->g = gx_clamp_u8((float)base.g * gx_clamp01(lg));
+    v->b = gx_clamp_u8((float)base.b * gx_clamp01(lb));
+    v->a = out_alpha;
+}
+
+static void gx_texgen_source(const PS3GxVertex* v, GXTexGenSrc src, const float raw_s[GX_MAX_TEXCOORD],
+                             const float raw_t[GX_MAX_TEXCOORD], float* x, float* y, float* z) {
+    if (src >= GX_TG_TEX0 && src <= GX_TG_TEX7) {
+        int idx = (int)(src - GX_TG_TEX0);
+        *x = raw_s[idx];
+        *y = raw_t[idx];
+        *z = 1.0f;
+        return;
+    }
+    if (src >= GX_TG_TEXCOORD0 && src <= GX_TG_TEXCOORD6) {
+        int idx = (int)(src - GX_TG_TEXCOORD0);
+        *x = raw_s[idx];
+        *y = raw_t[idx];
+        *z = 1.0f;
+        return;
+    }
+    switch (src) {
+        case GX_TG_NRM:
+        case GX_TG_BINRM:
+        case GX_TG_TANGENT:
+            *x = v->nx;
+            *y = v->ny;
+            *z = v->nz;
+            break;
+        case GX_TG_COLOR0:
+        case GX_TG_COLOR1:
+            *x = (float)v->r / 255.0f;
+            *y = (float)v->g / 255.0f;
+            *z = (float)v->b / 255.0f;
+            break;
+        case GX_TG_POS:
+        default:
+            *x = v->x;
+            *y = v->y;
+            *z = v->z;
+            break;
+    }
+}
+
+static void gx_generate_texcoords(PS3GxVertex* v) {
+    float raw_s[GX_MAX_TEXCOORD];
+    float raw_t[GX_MAX_TEXCOORD];
+    int gens = s_num_tex_gens;
+
+    for (int i = 0; i < GX_MAX_TEXCOORD; i++) {
+        raw_s[i] = v->s[i];
+        raw_t[i] = v->t[i];
+    }
+    if (gens > GX_MAX_TEXCOORD) {
+        gens = GX_MAX_TEXCOORD;
+    }
+
+    for (int i = 0; i < gens; i++) {
+        const PS3GxTexGen* gen = &s_tex_gens[i];
+        float x, y, z;
+        float ns, nt, nq;
+        int midx;
+        const f32* m;
+        GXTexMtxType mtype;
+        if (!gen->enabled) {
+            continue;
+        }
+        gx_texgen_source(v, gen->src, raw_s, raw_t, &x, &y, &z);
+        if (gen->normalize) {
+            gx_normalize3(&x, &y, &z);
+        }
+        midx = gx_tex_mtx_index(gen->mtx);
+        if (gen->mtx == GX_IDENTITY || midx < 0) {
+            v->s[i] = x;
+            v->t[i] = y;
+            v->has_texcoord[i] = 1;
+            continue;
+        }
+        m = s_tex_mtx[midx];
+        mtype = s_tex_mtx_type[midx];
+        ns = m[0] * x + m[1] * y + m[2] * z + m[3];
+        nt = m[4] * x + m[5] * y + m[6] * z + m[7];
+        if (gen->func == GX_TG_MTX3x4 || mtype == GX_MTX3x4) {
+            nq = m[8] * x + m[9] * y + m[10] * z + m[11];
+            if (fabsf(nq) > 0.000001f) {
+                ns /= nq;
+                nt /= nq;
+            }
+        }
+        v->s[i] = ns;
+        v->t[i] = nt;
+        v->has_texcoord[i] = 1;
+    }
+}
+
 static void gx_transform_vertex(PS3GxVertex* v) {
     const f32* m = s_pos_mtx[s_current_mtx % PS3_GX_MAX_MTX];
     f32 wx = m[0] * v->x + m[1] * v->y + m[2] * v->z + m[3];
     f32 wy = m[4] * v->x + m[5] * v->y + m[6] * v->z + m[7];
     f32 wz = m[8] * v->x + m[9] * v->y + m[10] * v->z + m[11];
+    v->rw = 1.0f;
+    gx_generate_texcoords(v);
+    gx_apply_lighting(v);
 
     if (s_projection_valid) {
         f32 cx = s_projection[0] * wx + s_projection[1] * wy + s_projection[2] * wz + s_projection[3];
@@ -768,9 +1378,13 @@ static void gx_transform_vertex(PS3GxVertex* v) {
         f32 cz = s_projection[8] * wx + s_projection[9] * wy + s_projection[10] * wz + s_projection[11];
         f32 cw = s_projection[12] * wx + s_projection[13] * wy + s_projection[14] * wz + s_projection[15];
         if (fabsf(cw) > 0.00001f) {
-            cx /= cw;
-            cy /= cw;
-            cz /= cw;
+            f32 invw = 1.0f / cw;
+            cx *= invw;
+            cy *= invw;
+            cz *= invw;
+            if (s_projection_type == GX_PERSPECTIVE) {
+                v->rw = invw;
+            }
         }
         v->sx = s_view_left + (cx + 1.0f) * 0.5f * s_view_w;
         v->sy = s_view_top + (1.0f - (cy + 1.0f) * 0.5f) * s_view_h;
@@ -804,6 +1418,11 @@ static void gx_draw_triangle(const PS3GxVertex* a, const PS3GxVertex* b, const P
     if (min_y < 0) min_y = 0;
     if (max_x >= (int)s_screen_w) max_x = (int)s_screen_w - 1;
     if (max_y >= (int)s_screen_h) max_y = (int)s_screen_h - 1;
+    if (min_x < s_scissor_left) min_x = s_scissor_left;
+    if (min_y < s_scissor_top) min_y = s_scissor_top;
+    if (max_x > s_scissor_right) max_x = s_scissor_right;
+    if (max_y > s_scissor_bottom) max_y = s_scissor_bottom;
+    if (min_x > max_x || min_y > max_y) return;
 
     for (int y = min_y; y <= max_y; y++) {
         for (int x = min_x; x <= max_x; x++) {
@@ -816,18 +1435,37 @@ static void gx_draw_triangle(const PS3GxVertex* a, const PS3GxVertex* b, const P
                                       : (w0 <= 0.0f && w1 <= 0.0f && w2 <= 0.0f);
             if (inside) {
                 float iw = 1.0f / area;
-                u8 r = (u8)(a->r * w0 * iw + b->r * w1 * iw + c->r * w2 * iw);
-                u8 g = (u8)(a->g * w0 * iw + b->g * w1 * iw + c->g * w2 * iw);
-                u8 bch = (u8)(a->b * w0 * iw + b->b * w1 * iw + c->b * w2 * iw);
-                u8 al = (u8)(a->a * w0 * iw + b->a * w1 * iw + c->a * w2 * iw);
-                float ts = a->s * w0 * iw + b->s * w1 * iw + c->s * w2 * iw;
-                float tt = a->t * w0 * iw + b->t * w1 * iw + c->t * w2 * iw;
-                float z = a->sz * w0 * iw + b->sz * w1 * iw + c->sz * w2 * iw;
-                if (!gx_depth_test_at(x, y, z)) {
-                    continue;
+                float l0 = w0 * iw;
+                float l1 = w1 * iw;
+                float l2 = w2 * iw;
+                float rw = a->rw * l0 + b->rw * l1 + c->rw * l2;
+                float pa = l0;
+                float pb = l1;
+                float pc = l2;
+                u8 r, g, bch, al;
+                float ts[GX_MAX_TEXCOORD];
+                float tt[GX_MAX_TEXCOORD];
+                float z = a->sz * l0 + b->sz * l1 + c->sz * l2;
+
+                if (fabsf(rw) > 0.000001f) {
+                    pa = (a->rw * l0) / rw;
+                    pb = (b->rw * l1) / rw;
+                    pc = (c->rw * l2) / rw;
+                }
+
+                r = gx_clamp_u8(a->r * pa + b->r * pb + c->r * pc);
+                g = gx_clamp_u8(a->g * pa + b->g * pb + c->g * pc);
+                bch = gx_clamp_u8(a->b * pa + b->b * pb + c->b * pc);
+                al = gx_clamp_u8(a->a * pa + b->a * pb + c->a * pc);
+                for (int coord = 0; coord < GX_MAX_TEXCOORD; coord++) {
+                    ts[coord] = a->s[coord] * pa + b->s[coord] * pb + c->s[coord] * pc;
+                    tt[coord] = a->t[coord] * pa + b->t[coord] * pb + c->t[coord] * pc;
                 }
                 apply_tev(ts, tt, z, &r, &g, &bch, &al);
                 if (!gx_alpha_test(al)) {
+                    continue;
+                }
+                if (!gx_depth_test_at(x, y, z)) {
                     continue;
                 }
                 gx_plot(x, y, r, g, bch, al);
@@ -845,20 +1483,25 @@ static void gx_draw_line(const PS3GxVertex* a, const PS3GxVertex* b) {
     int steps = abs(x1 - x0);
     int ysteps = abs(y1 - y0);
     int n = 0;
+    int radius = (int)(s_line_width > 0 ? (s_line_width - 1) / 2 : 0);
     if (ysteps > steps) steps = ysteps;
 
     for (;;) {
         float f = steps > 0 ? (float)n / (float)steps : 0.0f;
         float z = a->sz + (b->sz - a->sz) * f;
-        float ts = a->s + (b->s - a->s) * f;
-        float tt = a->t + (b->t - a->t) * f;
+        float ts[GX_MAX_TEXCOORD];
+        float tt[GX_MAX_TEXCOORD];
         u8 r = (u8)(a->r + (b->r - a->r) * f);
         u8 g = (u8)(a->g + (b->g - a->g) * f);
         u8 bch = (u8)(a->b + (b->b - a->b) * f);
         u8 al = (u8)(a->a + (b->a - a->a) * f);
+        for (int coord = 0; coord < GX_MAX_TEXCOORD; coord++) {
+            ts[coord] = a->s[coord] + (b->s[coord] - a->s[coord]) * f;
+            tt[coord] = a->t[coord] + (b->t[coord] - a->t[coord]) * f;
+        }
         apply_tev(ts, tt, z, &r, &g, &bch, &al);
         if (gx_alpha_test(al)) {
-            gx_plot_depth(x0, y0, z, r, g, bch, al);
+            gx_plot_square_depth(x0, y0, radius, z, r, g, bch, al);
         }
         if (x0 == x1 && y0 == y1) break;
         int e2 = err * 2;
@@ -873,6 +1516,7 @@ static void gx_commit_pending_vertex(void) {
         gx_transform_vertex(&s_current_vertex);
         s_vertices[s_vertex_count++] = s_current_vertex;
         s_vertex_pending = 0;
+        gx_reset_current_vertex();
         if (s_expected_verts != 0 && s_vertex_count >= s_expected_verts) {
             gx_flush_vertices();
         }
@@ -916,11 +1560,12 @@ static void gx_flush_vertices(void) {
                 u8 g = s_vertices[i].g;
                 u8 b = s_vertices[i].b;
                 u8 a = s_vertices[i].a;
+                int radius = (int)(s_point_size > 0 ? (s_point_size - 1) / 2 : 0);
                 apply_tev(s_vertices[i].s, s_vertices[i].t, s_vertices[i].sz, &r, &g, &b, &a);
                 if (!gx_alpha_test(a)) {
                     continue;
                 }
-                gx_plot_depth((int)s_vertices[i].sx, (int)s_vertices[i].sy, s_vertices[i].sz, r, g, b, a);
+                gx_plot_square_depth((int)s_vertices[i].sx, (int)s_vertices[i].sy, radius, s_vertices[i].sz, r, g, b, a);
             }
             break;
         default:
@@ -935,8 +1580,17 @@ static void gx_flush_vertices(void) {
 static int gx_alloc_depth_buffer(void) {
     u32 pixels = (u32)s_screen_w * (u32)s_screen_h;
     free(s_z_buffer);
+    free(s_alpha_buffer);
     s_z_buffer = (float*)malloc(sizeof(float) * pixels);
-    return s_z_buffer != NULL;
+    s_alpha_buffer = (u8*)malloc(pixels);
+    if (!s_z_buffer || !s_alpha_buffer) {
+        free(s_z_buffer);
+        free(s_alpha_buffer);
+        s_z_buffer = NULL;
+        s_alpha_buffer = NULL;
+        return 0;
+    }
+    return 1;
 }
 
 static void gx_dl_write(const void* data, u32 len) {
@@ -954,14 +1608,19 @@ static void gx_dl_write(const void* data, u32 len) {
 static GXColor gx_read_framebuffer_color(int x, int y) {
     GXColor out = { 0, 0, 0, 255 };
     u32* fb = gx_framebuffer();
+    u32 idx;
     u32 px;
     if (!fb || x < 0 || y < 0 || x >= (int)s_screen_w || y >= (int)s_screen_h) {
         return out;
     }
-    px = fb[(u32)y * s_screen_w + (u32)x];
+    idx = (u32)y * s_screen_w + (u32)x;
+    px = fb[idx];
     out.r = (u8)((px >> 16) & 0xFF);
     out.g = (u8)((px >> 8) & 0xFF);
     out.b = (u8)(px & 0xFF);
+    if (s_alpha_buffer) {
+        out.a = s_alpha_buffer[idx];
+    }
     return out;
 }
 
@@ -1113,6 +1772,18 @@ void ps3_gx_init(void) {
         s_screen_h = res.height;
         s_view_w = (f32)s_screen_w;
         s_view_h = (f32)s_screen_h;
+        s_scissor_left = 0;
+        s_scissor_top = 0;
+        s_scissor_right = (s32)s_screen_w - 1;
+        s_scissor_bottom = (s32)s_screen_h - 1;
+        s_tex_copy_src[2] = s_screen_w;
+        s_tex_copy_src[3] = s_screen_h;
+        s_tex_copy_dst_w = s_screen_w;
+        s_tex_copy_dst_h = s_screen_h;
+        s_disp_copy_src[2] = s_screen_w;
+        s_disp_copy_src[3] = s_screen_h;
+        s_disp_copy_dst_w = s_screen_w;
+        s_disp_copy_dst_h = s_screen_h;
 
         memset(&vconfig, 0, sizeof(vconfig));
         vconfig.resolution = state.displayMode.resolution;
@@ -1168,7 +1839,9 @@ void ps3_gx_shutdown(void) {
     free(s_buffers[1].ptr);
 #endif
     free(s_z_buffer);
+    free(s_alpha_buffer);
     s_z_buffer = NULL;
+    s_alpha_buffer = NULL;
     memset(s_buffers, 0, sizeof(s_buffers));
     s_gx_initialized = 0;
 }
@@ -1209,8 +1882,7 @@ void GXBegin(GXPrimitive type, GXVtxFmt vtxfmt, u16 nverts) {
     s_vertex_count = 0;
     s_in_begin = 1;
     s_vertex_pending = 0;
-    memset(&s_current_vertex, 0, sizeof(s_current_vertex));
-    s_current_vertex.r = s_current_vertex.g = s_current_vertex.b = s_current_vertex.a = 255;
+    gx_reset_current_vertex();
 }
 
 void GXEnd(void) { gx_flush_vertices(); }
@@ -1250,11 +1922,25 @@ void GXPosition1x16(u16 index) {
 }
 void GXPosition1x8(u8 index) { GXPosition1x16(index); }
 
-void GXNormal3f32(f32 x, f32 y, f32 z) { (void)x; (void)y; (void)z; }
-void GXNormal3s16(s16 x, s16 y, s16 z) { (void)x; (void)y; (void)z; }
-void GXNormal3s8(s8 x, s8 y, s8 z) { (void)x; (void)y; (void)z; }
-void GXNormal1x16(u16 index) { (void)index; }
-void GXNormal1x8(u8 index) { (void)index; }
+void GXNormal3f32(f32 x, f32 y, f32 z) {
+    s_current_vertex.nx = x;
+    s_current_vertex.ny = y;
+    s_current_vertex.nz = z;
+}
+void GXNormal3s16(s16 x, s16 y, s16 z) {
+    GXNormal3f32((f32)x / 32767.0f, (f32)y / 32767.0f, (f32)z / 32767.0f);
+}
+void GXNormal3s8(s8 x, s8 y, s8 z) {
+    GXNormal3f32((f32)x / 127.0f, (f32)y / 127.0f, (f32)z / 127.0f);
+}
+void GXNormal1x16(u16 index) {
+    if (s_array_base[GX_VA_NRM]) {
+        const u8* base = (const u8*)s_array_base[GX_VA_NRM];
+        const f32* nrm = (const f32*)(base + index * s_array_stride[GX_VA_NRM]);
+        GXNormal3f32(nrm[0], nrm[1], nrm[2]);
+    }
+}
+void GXNormal1x8(u8 index) { GXNormal1x16(index); }
 
 void GXColor4u8(u8 r, u8 g, u8 b, u8 a) {
     s_current_vertex.r = r;
@@ -1277,7 +1963,12 @@ void GXColor4f32(float r, float g, float b, float a) {
     GXColor4u8((u8)(r * 255.0f), (u8)(g * 255.0f), (u8)(b * 255.0f), (u8)(a * 255.0f));
 }
 
-void GXTexCoord2f32(f32 s, f32 t) { s_current_vertex.s = s; s_current_vertex.t = t; }
+void GXTexCoord2f32(f32 s, f32 t) {
+    int coord = gx_next_texcoord_slot();
+    s_current_vertex.s[coord] = s;
+    s_current_vertex.t[coord] = t;
+    s_current_vertex.has_texcoord[coord] = 1;
+}
 void GXTexCoord2u16(u16 s, u16 t) { GXTexCoord2f32((f32)s, (f32)t); }
 void GXTexCoord2s16(s16 s, s16 t) { GXTexCoord2f32((f32)s, (f32)t); }
 void GXTexCoord2u8(u8 s, u8 t) { GXTexCoord2f32((f32)s, (f32)t); }
@@ -1297,7 +1988,7 @@ void GXTexCoord1x16(u16 index) {
 void GXTexCoord1x8(u8 index) { GXTexCoord1x16(index); }
 
 void GXSetProjection(const void* mtx, GXProjectionType type) {
-    (void)type;
+    s_projection_type = type;
     if (mtx) {
         memcpy(s_projection, mtx, sizeof(s_projection));
         s_projection_valid = 1;
@@ -1307,7 +1998,13 @@ void GXLoadPosMtxImm(const void* mtx, u32 id) {
     if (mtx && id < PS3_GX_MAX_MTX) memcpy(s_pos_mtx[id], mtx, sizeof(s_pos_mtx[id]));
 }
 void GXLoadNrmMtxImm(const void* mtx, u32 id) { (void)mtx; (void)id; }
-void GXLoadTexMtxImm(const void* mtx, u32 id, GXTexMtxType type) { (void)mtx; (void)id; (void)type; }
+void GXLoadTexMtxImm(const void* mtx, u32 id, GXTexMtxType type) {
+    int idx = gx_tex_mtx_index(id);
+    if (idx >= 0 && mtx) {
+        memcpy(s_tex_mtx[idx], mtx, sizeof(s_tex_mtx[idx]));
+        s_tex_mtx_type[idx] = type;
+    }
+}
 void GXSetCurrentMtx(u32 id) { s_current_mtx = id % PS3_GX_MAX_MTX; }
 void GXSetViewport(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz) {
     s_view_left = left; s_view_top = top; s_view_w = wd; s_view_h = ht;
@@ -1317,7 +2014,30 @@ void GXSetViewport(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz) {
 void GXSetViewportJitter(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz, u32 field) {
     (void)field; GXSetViewport(left, top, wd, ht, nearz, farz);
 }
-void GXSetScissor(u32 left, u32 top, u32 wd, u32 ht) { (void)left; (void)top; (void)wd; (void)ht; }
+void GXSetScissor(u32 left, u32 top, u32 wd, u32 ht) {
+    s32 right;
+    s32 bottom;
+
+    if (wd == 0 || ht == 0) {
+        s_scissor_left = 1;
+        s_scissor_top = 1;
+        s_scissor_right = 0;
+        s_scissor_bottom = 0;
+        return;
+    }
+
+    right = (s32)(left + wd - 1u);
+    bottom = (s32)(top + ht - 1u);
+    s_scissor_left = (s32)left;
+    s_scissor_top = (s32)top;
+    s_scissor_right = right;
+    s_scissor_bottom = bottom;
+
+    if (s_scissor_left < 0) s_scissor_left = 0;
+    if (s_scissor_top < 0) s_scissor_top = 0;
+    if (s_scissor_right >= (s32)s_screen_w) s_scissor_right = (s32)s_screen_w - 1;
+    if (s_scissor_bottom >= (s32)s_screen_h) s_scissor_bottom = (s32)s_screen_h - 1;
+}
 void GXSetScissorBoxOffset(s32 x_off, s32 y_off) { (void)x_off; (void)y_off; }
 void GXSetClipMode(GXClipMode mode) { (void)mode; }
 
@@ -1334,13 +2054,33 @@ void GXSetArray(GXAttr attr, const void* data, u8 stride) {
     }
 }
 void GXInvalidateVtxCache(void) {}
-void GXSetNumTexGens(u8 nTexGens) { (void)nTexGens; }
+void GXSetNumTexGens(u8 nTexGens) {
+    s_num_tex_gens = nTexGens;
+    if (s_num_tex_gens > GX_MAX_TEXCOORD) {
+        s_num_tex_gens = GX_MAX_TEXCOORD;
+    }
+}
 void GXSetTexCoordGen2(GXTexCoordID dst_coord, GXTexGenType func, GXTexGenSrc src_param, u32 mtx,
                        GXBool normalize, u32 postmtx) {
-    (void)dst_coord; (void)func; (void)src_param; (void)mtx; (void)normalize; (void)postmtx;
+    if (dst_coord < GX_MAX_TEXCOORD) {
+        s_tex_gens[dst_coord].func = func;
+        s_tex_gens[dst_coord].src = src_param;
+        s_tex_gens[dst_coord].mtx = mtx;
+        s_tex_gens[dst_coord].postmtx = postmtx;
+        s_tex_gens[dst_coord].normalize = normalize;
+        s_tex_gens[dst_coord].enabled = GX_TRUE;
+    }
 }
-void GXSetLineWidth(u8 width, GXTexOffset texOffsets) { (void)width; (void)texOffsets; }
-void GXSetPointSize(u8 pointSize, GXTexOffset texOffsets) { (void)pointSize; (void)texOffsets; }
+void GXSetLineWidth(u8 width, GXTexOffset texOffsets) {
+    (void)texOffsets;
+    s_line_width = (u8)((width + 5u) / 6u);
+    if (s_line_width == 0) s_line_width = 1;
+}
+void GXSetPointSize(u8 pointSize, GXTexOffset texOffsets) {
+    (void)texOffsets;
+    s_point_size = (u8)((pointSize + 5u) / 6u);
+    if (s_point_size == 0) s_point_size = 1;
+}
 void GXEnableTexOffsets(GXTexCoordID coord, GXBool line_enable, GXBool point_enable) {
     (void)coord; (void)line_enable; (void)point_enable;
 }
@@ -1349,10 +2089,36 @@ void GXSetCopyClear(GXColor clear_clr, u32 clear_z) {
     s_clear_color = clear_clr;
     s_clear_z = (float)(clear_z & 0x00FFFFFFu) / 16777215.0f;
 }
-void GXCopyDisp(void* dest, GXBool clear) { (void)dest; if (clear) gx_clear_framebuffer(); }
+void GXCopyDisp(void* dest, GXBool clear) {
+    u32* out = (u32*)dest;
+    u32 dst_w = s_disp_copy_dst_w ? s_disp_copy_dst_w : s_screen_w;
+    u32 dst_h = s_disp_copy_dst_h ? s_disp_copy_dst_h : s_screen_h;
+    u32 src_w = s_disp_copy_src[2] ? s_disp_copy_src[2] : s_screen_w;
+    u32 src_h = s_disp_copy_src[3] ? s_disp_copy_src[3] : s_screen_h;
+
+    if (out) {
+        for (u32 y = 0; y < dst_h; y++) {
+            for (u32 x = 0; x < dst_w; x++) {
+                int sx = (int)s_disp_copy_src[0] + (int)((u64)x * src_w / dst_w);
+                int sy = (int)s_disp_copy_src[1] + (int)((u64)y * src_h / dst_h);
+                GXColor c = gx_read_framebuffer_color(sx, sy);
+                out[y * dst_w + x] = pack_xrgb(c.r, c.g, c.b);
+            }
+        }
+    }
+    if (clear) gx_clear_framebuffer();
+}
 void GXSetDispCopyGamma(GXGamma gamma) { (void)gamma; }
-void GXSetDispCopySrc(u16 left, u16 top, u16 wd, u16 ht) { (void)left; (void)top; (void)wd; (void)ht; }
-void GXSetDispCopyDst(u16 wd, u16 ht) { (void)wd; (void)ht; }
+void GXSetDispCopySrc(u16 left, u16 top, u16 wd, u16 ht) {
+    s_disp_copy_src[0] = left;
+    s_disp_copy_src[1] = top;
+    s_disp_copy_src[2] = wd;
+    s_disp_copy_src[3] = ht;
+}
+void GXSetDispCopyDst(u16 wd, u16 ht) {
+    s_disp_copy_dst_w = wd;
+    s_disp_copy_dst_h = ht;
+}
 f32 GXGetYScaleFactor(u16 efbHeight, u16 xfbHeight) {
     return (efbHeight && xfbHeight) ? ((f32)xfbHeight / (f32)efbHeight) : 1.0f;
 }
@@ -1408,6 +2174,8 @@ void GXSetCopyClamp(GXFBClamp clamp) { (void)clamp; }
 
 static PS3GxTexObj* tex_obj(GXTexObj* obj) { return (PS3GxTexObj*)obj; }
 static const PS3GxTexObj* ctex_obj(const GXTexObj* obj) { return (const PS3GxTexObj*)obj; }
+static PS3GxTlutObj* tlut_obj(GXTlutObj* obj) { return (PS3GxTlutObj*)obj; }
+static const PS3GxTlutObj* ctlut_obj(const GXTlutObj* obj) { return (const PS3GxTlutObj*)obj; }
 void GXInitTexObj(GXTexObj* obj, void* image_ptr, u16 width, u16 height, GXTexFmt format,
                   GXTexWrapMode wrap_s, GXTexWrapMode wrap_t, u8 mipmap) {
     PS3GxTexObj* t = tex_obj(obj);
@@ -1439,19 +2207,22 @@ u32 GXGetTexBufferSize(u16 width, u16 height, u32 format, GXBool mipmap, u8 max_
     u32 size;
     (void)mipmap;
     (void)max_lod;
-    switch ((GXTexFmt)format) {
+    switch (format) {
         case GX_TF_I4:
+        case GX_TF_C4:
             size = gx_ceil_div_u32(width, 8) * gx_ceil_div_u32(height, 8) * 32u;
             break;
         case GX_TF_I8:
         case GX_TF_IA4:
         case GX_TF_A8:
+        case GX_TF_C8:
         case GX_CTF_R8:
             size = gx_ceil_div_u32(width, 8) * gx_ceil_div_u32(height, 4) * 32u;
             break;
         case GX_TF_IA8:
         case GX_TF_RGB565:
         case GX_TF_RGB5A3:
+        case GX_TF_C14X2:
             size = gx_ceil_div_u32(width, 4) * gx_ceil_div_u32(height, 4) * 32u;
             break;
         case GX_TF_RGBA8:
@@ -1472,8 +2243,20 @@ void GXInvalidateTexRegion(GXTexRegion* region) { (void)region; }
 void GXInitTexObjWrapMode(GXTexObj* obj, GXTexWrapMode s, GXTexWrapMode t) { tex_obj(obj)->wrap_s = s; tex_obj(obj)->wrap_t = t; }
 void GXDestroyTexObj(GXTexObj* obj) { if (obj) memset(obj, 0, sizeof(*obj)); }
 void GXDestroyTlutObj(GXTlutObj* obj) { if (obj) memset(obj, 0, sizeof(*obj)); }
-void GXInitTlutObj(GXTlutObj* tlut_obj, void* lut, GXTlutFmt fmt, u16 n_entries) { (void)tlut_obj; (void)lut; (void)fmt; (void)n_entries; }
-void GXLoadTlut(GXTlutObj* obj, u32 idx) { (void)obj; (void)idx; }
+void GXInitTlutObj(GXTlutObj* obj, void* lut, GXTlutFmt fmt, u16 n_entries) {
+    PS3GxTlutObj* t;
+    if (!obj) return;
+    t = tlut_obj(obj);
+    memset(t, 0, sizeof(*t));
+    t->lut = (uintptr_t)lut;
+    t->format = fmt;
+    t->n_entries = n_entries;
+}
+void GXLoadTlut(GXTlutObj* obj, u32 idx) {
+    if (obj && idx < PS3_GX_MAX_TLUTS) {
+        s_tluts[idx] = *ctlut_obj(obj);
+    }
+}
 void GXInitTexCacheRegion(GXTexRegion* region, GXBool is_32b_mipmap, u32 tmem_even, GXTexCacheSize size_even,
                           u32 tmem_odd, GXTexCacheSize size_odd) {
     (void)region; (void)is_32b_mipmap; (void)tmem_even; (void)size_even; (void)tmem_odd; (void)size_odd;
@@ -1491,11 +2274,14 @@ GXTexWrapMode GXGetTexObjWrapT(const GXTexObj* obj) { return (GXTexWrapMode)ctex
 void* GXGetTexObjData(const GXTexObj* obj) { return ctex_obj(obj)->image; }
 
 void GXSetBlendMode(GXBlendMode type, GXBlendFactor src_fact, GXBlendFactor dst_fact, GXLogicOp op) {
-    (void)src_fact; (void)dst_fact; (void)op;
+    s_blend_mode = type;
+    s_blend_src = src_fact;
+    s_blend_dst = dst_fact;
+    s_logic_op = op;
     s_blend_enable = (type != GX_BM_NONE) ? GX_TRUE : GX_FALSE;
 }
 void GXSetColorUpdate(GXBool update_enable) { s_color_update = update_enable; }
-void GXSetAlphaUpdate(GXBool update_enable) { (void)update_enable; }
+void GXSetAlphaUpdate(GXBool update_enable) { s_alpha_update = update_enable; }
 void GXSetZMode(GXBool compare_enable, GXCompare func, GXBool update_enable) {
     s_z_compare_enable = compare_enable;
     s_z_func = func;
@@ -1503,7 +2289,10 @@ void GXSetZMode(GXBool compare_enable, GXCompare func, GXBool update_enable) {
 }
 void GXSetZCompLoc(GXBool before_tex) { (void)before_tex; }
 void GXSetDither(GXBool dither) { (void)dither; }
-void GXSetDstAlpha(GXBool enable, u8 alpha) { (void)enable; (void)alpha; }
+void GXSetDstAlpha(GXBool enable, u8 alpha) {
+    s_dst_alpha_enable = enable;
+    s_dst_alpha = alpha;
+}
 void GXSetFieldMask(GXBool odd_mask, GXBool even_mask) { (void)odd_mask; (void)even_mask; }
 void GXSetFieldMode(GXBool field_mode, GXBool half_aspect_ratio) { (void)field_mode; (void)half_aspect_ratio; }
 void GXSetFog(GXFogType type, f32 startz, f32 endz, f32 nearz, f32 farz, GXColor color) {
@@ -1615,8 +2404,20 @@ void GXSetTevKAlphaSel(GXTevStageID stage, GXTevKAlphaSel sel) {
         s_tev_stages[stage].k_alpha_sel = sel;
     }
 }
-void GXSetTevSwapMode(GXTevStageID stage, GXTevSwapSel ras_sel, GXTevSwapSel tex_sel) { (void)stage; (void)ras_sel; (void)tex_sel; }
-void GXSetTevSwapModeTable(GXTevSwapSel table, GXTevColorChan red, GXTevColorChan green, GXTevColorChan blue, GXTevColorChan alpha) { (void)table; (void)red; (void)green; (void)blue; (void)alpha; }
+void GXSetTevSwapMode(GXTevStageID stage, GXTevSwapSel ras_sel, GXTevSwapSel tex_sel) {
+    if (stage < GX_MAX_TEVSTAGE) {
+        s_tev_stages[stage].ras_swap = (ras_sel < GX_MAX_TEVSWAP) ? ras_sel : GX_TEV_SWAP0;
+        s_tev_stages[stage].tex_swap = (tex_sel < GX_MAX_TEVSWAP) ? tex_sel : GX_TEV_SWAP0;
+    }
+}
+void GXSetTevSwapModeTable(GXTevSwapSel table, GXTevColorChan red, GXTevColorChan green, GXTevColorChan blue, GXTevColorChan alpha) {
+    if (table < GX_MAX_TEVSWAP) {
+        s_tev_swap_table[table][0] = (u8)red;
+        s_tev_swap_table[table][1] = (u8)green;
+        s_tev_swap_table[table][2] = (u8)blue;
+        s_tev_swap_table[table][3] = (u8)alpha;
+    }
+}
 void GXSetAlphaCompare(GXCompare comp0, u8 ref0, GXAlphaOp op, GXCompare comp1, u8 ref1) {
     s_alpha_comp0 = comp0;
     s_alpha_ref0 = ref0;
@@ -1662,25 +2463,107 @@ void GXSetTevIndWarp(GXTevStageID tev_stage, GXIndTexStageID ind_stage, GXBool s
 void GXSetIndTexCoordScale(GXIndTexStageID ind_state, GXIndTexScale scale_s, GXIndTexScale scale_t) { (void)ind_state; (void)scale_s; (void)scale_t; }
 void __GXSetIndirectMask(u32 mask) { (void)mask; }
 
-void GXSetNumChans(u8 nChans) { (void)nChans; }
-void GXSetChanCtrl(GXChannelID chan, GXBool enable, GXColorSrc amb_src, GXColorSrc mat_src, u32 light_mask, GXDiffuseFn diff_fn, GXAttnFn attn_fn) {
-    (void)chan; (void)enable; (void)amb_src; (void)mat_src; (void)light_mask; (void)diff_fn; (void)attn_fn;
+void GXSetNumChans(u8 nChans) {
+    s_num_chans = nChans > 2 ? 2 : nChans;
 }
-void GXSetChanAmbColor(GXChannelID chan, GXColor amb_color) { (void)chan; (void)amb_color; }
-void GXSetChanMatColor(GXChannelID chan, GXColor mat_color) { (void)chan; (void)mat_color; }
+void GXSetChanCtrl(GXChannelID chan, GXBool enable, GXColorSrc amb_src, GXColorSrc mat_src, u32 light_mask, GXDiffuseFn diff_fn, GXAttnFn attn_fn) {
+    int idx = gx_chan_index(chan);
+    PS3GxChanCtrl next;
+    next.enable = enable;
+    next.amb_src = amb_src;
+    next.mat_src = mat_src;
+    next.light_mask = light_mask;
+    next.diff_fn = diff_fn;
+    next.attn_fn = attn_fn;
+
+    if (chan == GX_ALPHA0 || chan == GX_ALPHA1) {
+        s_alpha_chan_ctrl[idx] = next;
+    } else if (chan == GX_COLOR0A0 || chan == GX_COLOR1A1) {
+        s_chan_ctrl[idx] = next;
+        s_alpha_chan_ctrl[idx] = next;
+    } else {
+        s_chan_ctrl[idx] = next;
+    }
+}
+void GXSetChanAmbColor(GXChannelID chan, GXColor amb_color) {
+    s_chan_amb_color[gx_chan_index(chan)] = amb_color;
+}
+void GXSetChanMatColor(GXChannelID chan, GXColor mat_color) {
+    s_chan_mat_color[gx_chan_index(chan)] = mat_color;
+}
+static PS3GxLightObj* gx_light_obj(GXLightObj* lt_obj) { return (PS3GxLightObj*)lt_obj; }
+static const PS3GxLightObj* gx_clight_obj(const GXLightObj* lt_obj) { return (const PS3GxLightObj*)lt_obj; }
 void GXInitLightSpot(GXLightObj* lt_obj, f32 cutoff, GXSpotFn spot_func) { (void)lt_obj; (void)cutoff; (void)spot_func; }
 void GXInitLightDistAttn(GXLightObj* lt_obj, f32 ref_distance, f32 ref_brightness, GXDistAttnFn dist_func) { (void)lt_obj; (void)ref_distance; (void)ref_brightness; (void)dist_func; }
-void GXInitLightPos(GXLightObj* lt_obj, f32 x, f32 y, f32 z) { if (lt_obj) { f32* f = (f32*)lt_obj; f[0] = x; f[1] = y; f[2] = z; } }
-void GXInitLightDir(GXLightObj* lt_obj, f32 nx, f32 ny, f32 nz) { if (lt_obj) { f32* f = (f32*)lt_obj; f[3] = nx; f[4] = ny; f[5] = nz; } }
-void GXInitLightColor(GXLightObj* lt_obj, GXColor color) { if (lt_obj) memcpy(lt_obj, &color, sizeof(color)); }
-void GXInitLightAttn(GXLightObj* lt_obj, f32 a0, f32 a1, f32 a2, f32 k0, f32 k1, f32 k2) { (void)lt_obj; (void)a0; (void)a1; (void)a2; (void)k0; (void)k1; (void)k2; }
-void GXInitLightAttnA(GXLightObj* lt_obj, f32 a0, f32 a1, f32 a2) { (void)lt_obj; (void)a0; (void)a1; (void)a2; }
-void GXInitLightAttnK(GXLightObj* lt_obj, f32 k0, f32 k1, f32 k2) { (void)lt_obj; (void)k0; (void)k1; (void)k2; }
-void GXLoadLightObjImm(GXLightObj* lt_obj, GXLightID light) { (void)lt_obj; (void)light; }
-void GXGetLightPos(GXLightObj* lt_obj, f32* x, f32* y, f32* z) { f32* f = (f32*)lt_obj; if (x) *x = f ? f[0] : 0.0f; if (y) *y = f ? f[1] : 0.0f; if (z) *z = f ? f[2] : 0.0f; }
+void GXInitLightPos(GXLightObj* lt_obj, f32 x, f32 y, f32 z) {
+    if (lt_obj) {
+        PS3GxLightObj* l = gx_light_obj(lt_obj);
+        l->pos[0] = x;
+        l->pos[1] = y;
+        l->pos[2] = z;
+    }
+}
+void GXInitLightDir(GXLightObj* lt_obj, f32 nx, f32 ny, f32 nz) {
+    if (lt_obj) {
+        PS3GxLightObj* l = gx_light_obj(lt_obj);
+        l->dir[0] = nx;
+        l->dir[1] = ny;
+        l->dir[2] = nz;
+    }
+}
+void GXInitLightColor(GXLightObj* lt_obj, GXColor color) {
+    if (lt_obj) {
+        gx_light_obj(lt_obj)->color = color;
+    }
+}
+void GXInitLightAttn(GXLightObj* lt_obj, f32 a0, f32 a1, f32 a2, f32 k0, f32 k1, f32 k2) {
+    if (lt_obj) {
+        PS3GxLightObj* l = gx_light_obj(lt_obj);
+        l->attn_a[0] = a0;
+        l->attn_a[1] = a1;
+        l->attn_a[2] = a2;
+        l->attn_k[0] = k0;
+        l->attn_k[1] = k1;
+        l->attn_k[2] = k2;
+    }
+}
+void GXInitLightAttnA(GXLightObj* lt_obj, f32 a0, f32 a1, f32 a2) {
+    if (lt_obj) {
+        PS3GxLightObj* l = gx_light_obj(lt_obj);
+        l->attn_a[0] = a0;
+        l->attn_a[1] = a1;
+        l->attn_a[2] = a2;
+    }
+}
+void GXInitLightAttnK(GXLightObj* lt_obj, f32 k0, f32 k1, f32 k2) {
+    if (lt_obj) {
+        PS3GxLightObj* l = gx_light_obj(lt_obj);
+        l->attn_k[0] = k0;
+        l->attn_k[1] = k1;
+        l->attn_k[2] = k2;
+    }
+}
+void GXLoadLightObjImm(GXLightObj* lt_obj, GXLightID light) {
+    if (!lt_obj) {
+        return;
+    }
+    for (int i = 0; i < PS3_GX_MAX_LIGHTS; i++) {
+        if (((u32)light) & (1u << i)) {
+            s_lights[i] = *gx_clight_obj(lt_obj);
+            s_light_loaded[i] = 1;
+            break;
+        }
+    }
+}
+void GXGetLightPos(GXLightObj* lt_obj, f32* x, f32* y, f32* z) {
+    const PS3GxLightObj* l = gx_clight_obj(lt_obj);
+    if (x) *x = l ? l->pos[0] : 0.0f;
+    if (y) *y = l ? l->pos[1] : 0.0f;
+    if (z) *z = l ? l->pos[2] : 0.0f;
+}
 void GXGetLightColor(GXLightObj* lt_obj, GXColor* color) {
     if (!color) return;
-    if (lt_obj) memcpy(color, lt_obj, sizeof(*color));
+    if (lt_obj) *color = gx_clight_obj(lt_obj)->color;
     else memset(color, 0, sizeof(*color));
 }
 
