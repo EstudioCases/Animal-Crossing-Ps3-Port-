@@ -22,9 +22,9 @@
 #define PS3_ROM_DIR        PS3_USRDIR "/rom"
 #define PS3_SAVE_DIR       PS3_USRDIR "/save"
 
-#define PS3_MAIN_MEMORY_SIZE   (24 * 1024 * 1024)
+#define PS3_MAIN_MEMORY_SIZE   (48 * 1024 * 1024)
 #define PS3_ARAM_SIZE          (16 * 1024 * 1024)
-#define PS3_FIFO_SIZE          (256 * 1024)
+#define PS3_FIFO_SIZE          (1024 * 1024)
 
 #define PS3_PI  3.14159265358979323846
 #define PS3_PIf 3.14159265358979323846f

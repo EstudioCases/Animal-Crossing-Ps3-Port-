@@ -1,12 +1,12 @@
 ﻿**********************
 Inicio de la transcripción de Windows PowerShell
-Hora de inicio: 20260430132637
+Hora de inicio: 20260501203050
 Nombre de usuario: DESKTOP-LA1CH5N\xdfah
 Usuario RunAs: DESKTOP-LA1CH5N\xdfah
 Nombre de la configuración: 
 Máquina: DESKTOP-LA1CH5N (Microsoft Windows NT 10.0.26200.0)
 Aplicación host: C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\0apelotas\descargas2\ACGC-PS3-Port\Generar_PKG_con_ISO.ps1
-Id. de proceso: 181516
+Id. de proceso: 182512
 PSVersion: 5.1.26100.8115
 PSEdition: Desktop
 PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.8115
@@ -32,5 +32,5 @@ PKG size: 1,36 GB
 Build log: D:\0apelotas\descargas2\ACGC-PS3-Port\ps3\build-full\generate-pkg-with-iso.log
 **********************
 Fin de la transcripción de Windows PowerShell
-Hora de finalización: 20260430133113
+Hora de finalización: 20260501203419
 **********************

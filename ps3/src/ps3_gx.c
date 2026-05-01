@@ -26,6 +26,8 @@
 #define PS3_GX_MAX_TLUTS      1024
 #define PS3_GX_MAX_LIGHTS     8
 
+void OSReport(const char* fmt, ...);
+
 typedef struct {
     int width;
     int height;
@@ -181,7 +183,28 @@ static GXColor s_k_colors[GX_MAX_KCOLOR] = {
     { 255, 255, 255, 255 },
     { 255, 255, 255, 255 },
 };
+
+typedef struct {
+    u8* base;
+    u8* top;
+    u32 size;
+    u32 hiWatermark;
+    u32 loWatermark;
+    void* rdPtr;
+    void* wrPtr;
+    s32 count;
+    u8 bind_cpu;
+    u8 bind_gp;
+} PS3GxFifoObj;
+
 static GXFifoObj s_fifo;
+static u8 s_fifo_buffer[PS3_FIFO_SIZE] __attribute__((aligned(32)));
+static GXFifoObj* s_cpu_fifo = &s_fifo;
+static GXFifoObj* s_gp_fifo = &s_fifo;
+static OSThread* s_gx_thread = NULL;
+static int s_fifo_ready = 0;
+static int s_fifo_fallback_logged = 0;
+static int s_gx_thread_logged = 0;
 static PS3GxDisplayList s_dl;
 static GXDrawSyncCallback s_draw_sync_cb = NULL;
 static GXDrawDoneCallback s_draw_done_cb = NULL;
@@ -234,6 +257,52 @@ static u32* s_depth_buffer = NULL;
 static u32 s_depth_offset = 0;
 static u32 s_depth_pitch = 0;
 #endif
+
+static PS3GxFifoObj* gx_fifo_cast(GXFifoObj* fifo) {
+    return (PS3GxFifoObj*)(fifo ? fifo : &s_fifo);
+}
+
+static GXBool gx_fifo_ptr_in_range(const PS3GxFifoObj* f, const void* ptr) {
+    const u8* p = (const u8*)ptr;
+    return (f && f->base && p >= f->base && p < f->top) ? GX_TRUE : GX_FALSE;
+}
+
+static GXFifoObj* gx_fifo_ensure(GXFifoObj* fifo, const char* caller) {
+    GXFifoObj* obj = fifo ? fifo : &s_fifo;
+    PS3GxFifoObj* f = gx_fifo_cast(obj);
+
+    if (!s_fifo_ready || !f->base || !f->top || f->size < 0x4000 || f->top <= f->base) {
+        memset(obj, 0, sizeof(*obj));
+        f = gx_fifo_cast(obj);
+        f->base = s_fifo_buffer;
+        f->top = s_fifo_buffer + sizeof(s_fifo_buffer);
+        f->size = (u32)sizeof(s_fifo_buffer);
+        f->loWatermark = 0;
+        f->hiWatermark = f->size - 32;
+        f->rdPtr = f->base;
+        f->wrPtr = f->base;
+        f->count = 0;
+        f->bind_cpu = (obj == s_cpu_fifo);
+        f->bind_gp = (obj == s_gp_fifo);
+        s_fifo_ready = 1;
+        if (!s_fifo_fallback_logged) {
+            OSReport("[PS3/GX] %s: initialized safe FIFO obj=%p base=%p size=%u\n",
+                     caller ? caller : "fifo", obj, f->base, f->size);
+            s_fifo_fallback_logged = 1;
+        }
+    }
+
+    if (!gx_fifo_ptr_in_range(f, f->rdPtr)) {
+        f->rdPtr = f->base;
+    }
+    if (!gx_fifo_ptr_in_range(f, f->wrPtr)) {
+        f->wrPtr = f->rdPtr;
+    }
+    if (f->count < 0 || (u32)f->count > f->size) {
+        f->count = 0;
+    }
+    return obj;
+}
 
 static u32 pack_xrgb(u8 r, u8 g, u8 b) {
     return ((u32)r << 16) | ((u32)g << 8) | (u32)b;
@@ -1869,8 +1938,11 @@ void ps3_gx_present(void) {
 }
 
 GXFifoObj* GXInit(void* base, u32 size) {
-    (void)base; (void)size;
     ps3_gx_init();
+    GXInitFifoBase(&s_fifo, base, size);
+    GXInitFifoPtrs(&s_fifo, NULL, NULL);
+    GXSetCPUFifo(&s_fifo);
+    GXSetGPFifo(&s_fifo);
     return &s_fifo;
 }
 
@@ -2573,13 +2645,63 @@ u16 GXReadDrawSync(void) { return s_draw_token; }
 GXDrawSyncCallback GXSetDrawSyncCallback(GXDrawSyncCallback cb) { GXDrawSyncCallback old = s_draw_sync_cb; s_draw_sync_cb = cb; return old; }
 GXDrawDoneCallback GXSetDrawDoneCallback(GXDrawDoneCallback cb) { GXDrawDoneCallback old = s_draw_done_cb; s_draw_done_cb = cb; return old; }
 
-void GXInitFifoBase(GXFifoObj* fifo, void* base, u32 size) { (void)base; (void)size; if (fifo) memset(fifo, 0, sizeof(*fifo)); }
-void GXInitFifoPtrs(GXFifoObj* fifo, void* readPtr, void* writePtr) { (void)fifo; (void)readPtr; (void)writePtr; }
-void GXInitFifoLimits(GXFifoObj* fifo, u32 hiWatermark, u32 loWatermark) { (void)fifo; (void)hiWatermark; (void)loWatermark; }
-void GXSetCPUFifo(GXFifoObj* fifo) { (void)fifo; }
-void GXSetGPFifo(GXFifoObj* fifo) { (void)fifo; }
-void GXSaveCPUFifo(GXFifoObj* fifo) { if (fifo) *fifo = s_fifo; }
-void GXSaveGPFifo(GXFifoObj* fifo) { if (fifo) *fifo = s_fifo; }
+void GXInitFifoBase(GXFifoObj* fifo, void* base, u32 size) {
+    GXFifoObj* obj = fifo ? fifo : &s_fifo;
+    PS3GxFifoObj* f = gx_fifo_cast(obj);
+    u8* safe_base = (u8*)base;
+    u32 safe_size = size;
+
+    if (!safe_base || safe_size < 0x4000) {
+        safe_base = s_fifo_buffer;
+        safe_size = (u32)sizeof(s_fifo_buffer);
+        if (!s_fifo_fallback_logged) {
+            OSReport("[PS3/GX] GXInitFifoBase: using fallback FIFO base=%p size=%u\n", safe_base, safe_size);
+            s_fifo_fallback_logged = 1;
+        }
+    }
+
+    memset(obj, 0, sizeof(*obj));
+    f->base = safe_base;
+    f->top = safe_base + safe_size;
+    f->size = safe_size;
+    f->loWatermark = 0;
+    f->hiWatermark = safe_size - 32;
+    f->rdPtr = safe_base;
+    f->wrPtr = safe_base;
+    f->count = 0;
+    s_fifo_ready = 1;
+}
+
+void GXInitFifoPtrs(GXFifoObj* fifo, void* readPtr, void* writePtr) {
+    GXFifoObj* obj = gx_fifo_ensure(fifo, "GXInitFifoPtrs");
+    PS3GxFifoObj* f = gx_fifo_cast(obj);
+    f->rdPtr = gx_fifo_ptr_in_range(f, readPtr) ? readPtr : f->base;
+    f->wrPtr = gx_fifo_ptr_in_range(f, writePtr) ? writePtr : f->rdPtr;
+    f->count = (s32)((u8*)f->wrPtr - (u8*)f->rdPtr);
+    if (f->count < 0) {
+        f->count += (s32)f->size;
+    }
+}
+
+void GXInitFifoLimits(GXFifoObj* fifo, u32 hiWatermark, u32 loWatermark) {
+    GXFifoObj* obj = gx_fifo_ensure(fifo, "GXInitFifoLimits");
+    PS3GxFifoObj* f = gx_fifo_cast(obj);
+    f->loWatermark = (loWatermark < f->size) ? loWatermark : 0;
+    f->hiWatermark = (hiWatermark > f->loWatermark && hiWatermark < f->size) ? hiWatermark : (f->size - 32);
+}
+
+void GXSetCPUFifo(GXFifoObj* fifo) {
+    s_cpu_fifo = gx_fifo_ensure(fifo, "GXSetCPUFifo");
+    gx_fifo_cast(s_cpu_fifo)->bind_cpu = 1;
+}
+
+void GXSetGPFifo(GXFifoObj* fifo) {
+    s_gp_fifo = gx_fifo_ensure(fifo, "GXSetGPFifo");
+    gx_fifo_cast(s_gp_fifo)->bind_gp = 1;
+}
+
+void GXSaveCPUFifo(GXFifoObj* fifo) { if (fifo) *fifo = *gx_fifo_ensure(s_cpu_fifo, "GXSaveCPUFifo"); }
+void GXSaveGPFifo(GXFifoObj* fifo) { if (fifo) *fifo = *gx_fifo_ensure(s_gp_fifo, "GXSaveGPFifo"); }
 void GXGetGPStatus(GXBool* overhi, GXBool* underlow, GXBool* readIdle, GXBool* cmdIdle, GXBool* brkpt) {
     if (overhi) *overhi = GX_FALSE;
     if (underlow) *underlow = GX_FALSE;
@@ -2588,25 +2710,57 @@ void GXGetGPStatus(GXBool* overhi, GXBool* underlow, GXBool* readIdle, GXBool* c
     if (brkpt) *brkpt = GX_FALSE;
 }
 void GXGetFifoStatus(GXFifoObj* fifo, GXBool* overhi, GXBool* underflow, u32* fifoCount, GXBool* cpuWrite, GXBool* gpRead, GXBool* fifowrap) {
-    (void)fifo;
+    PS3GxFifoObj* f = gx_fifo_cast(gx_fifo_ensure(fifo, "GXGetFifoStatus"));
     if (overhi) *overhi = GX_FALSE;
     if (underflow) *underflow = GX_FALSE;
-    if (fifoCount) *fifoCount = 0;
-    if (cpuWrite) *cpuWrite = GX_FALSE;
-    if (gpRead) *gpRead = GX_FALSE;
+    if (fifoCount) *fifoCount = (u32)f->count;
+    if (cpuWrite) *cpuWrite = f->bind_cpu ? GX_TRUE : GX_FALSE;
+    if (gpRead) *gpRead = f->bind_gp ? GX_TRUE : GX_FALSE;
     if (fifowrap) *fifowrap = GX_FALSE;
 }
-void GXGetFifoPtrs(GXFifoObj* fifo, void** readPtr, void** writePtr) { (void)fifo; if (readPtr) *readPtr = NULL; if (writePtr) *writePtr = NULL; }
-void* GXGetFifoBase(GXFifoObj* fifo) { (void)fifo; return NULL; }
-u32 GXGetFifoSize(GXFifoObj* fifo) { (void)fifo; return 0; }
-void GXGetFifoLimits(GXFifoObj* fifo, u32* hi, u32* lo) { (void)fifo; if (hi) *hi = 0; if (lo) *lo = 0; }
+void GXGetFifoPtrs(GXFifoObj* fifo, void** readPtr, void** writePtr) {
+    PS3GxFifoObj* f = gx_fifo_cast(gx_fifo_ensure(fifo, "GXGetFifoPtrs"));
+    if (readPtr) *readPtr = f->rdPtr;
+    if (writePtr) *writePtr = f->wrPtr;
+}
+void* GXGetFifoBase(GXFifoObj* fifo) {
+    return gx_fifo_cast(gx_fifo_ensure(fifo, "GXGetFifoBase"))->base;
+}
+u32 GXGetFifoSize(GXFifoObj* fifo) {
+    return gx_fifo_cast(gx_fifo_ensure(fifo, "GXGetFifoSize"))->size;
+}
+void GXGetFifoLimits(GXFifoObj* fifo, u32* hi, u32* lo) {
+    PS3GxFifoObj* f = gx_fifo_cast(gx_fifo_ensure(fifo, "GXGetFifoLimits"));
+    if (hi) *hi = f->hiWatermark;
+    if (lo) *lo = f->loWatermark;
+}
 GXBreakPtCallback GXSetBreakPtCallback(GXBreakPtCallback cb) { GXBreakPtCallback old = s_breakpt_cb; s_breakpt_cb = cb; return old; }
 void GXEnableBreakPt(void* break_pt) { (void)break_pt; if (s_breakpt_cb) s_breakpt_cb(); }
 void GXDisableBreakPt(void) {}
-OSThread* GXSetCurrentGXThread(void) { return NULL; }
-OSThread* GXGetCurrentGXThread(void) { return NULL; }
-GXFifoObj* GXGetCPUFifo(void) { return &s_fifo; }
-GXFifoObj* GXGetGPFifo(void) { return &s_fifo; }
+OSThread* GXSetCurrentGXThread(void) {
+    OSThread* old = s_gx_thread;
+    s_gx_thread = OSGetCurrentThread();
+    if (!s_gx_thread) {
+        s_gx_thread = old;
+    }
+    if (!s_gx_thread && !s_gx_thread_logged) {
+        OSReport("[PS3/GX] GXSetCurrentGXThread: OSGetCurrentThread returned null\n");
+        s_gx_thread_logged = 1;
+    }
+    return old;
+}
+OSThread* GXGetCurrentGXThread(void) {
+    if (!s_gx_thread) {
+        s_gx_thread = OSGetCurrentThread();
+        if (s_gx_thread && !s_gx_thread_logged) {
+            OSReport("[PS3/GX] GXGetCurrentGXThread: defaulting to current thread %p\n", s_gx_thread);
+            s_gx_thread_logged = 1;
+        }
+    }
+    return s_gx_thread;
+}
+GXFifoObj* GXGetCPUFifo(void) { return gx_fifo_ensure(s_cpu_fifo, "GXGetCPUFifo"); }
+GXFifoObj* GXGetGPFifo(void) { return gx_fifo_ensure(s_gp_fifo, "GXGetGPFifo"); }
 u32 GXGetOverflowCount(void) { return 0; }
 u32 GXResetOverflowCount(void) { return 0; }
 volatile void* GXRedirectWriteGatherPipe(void* ptr) { return ptr; }

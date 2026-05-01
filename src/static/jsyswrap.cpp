@@ -1,6 +1,7 @@
 #include "jsyswrap_cpp.h"
 
 #include "JSystem/JSystem.h"
+#include "JSystem/JFramework/JFWDisplay.h"
 #include "JSystem/JUtility/JUTGamePad.h"
 #include "JSystem/JUtility/TColor.h"
 #include "libforest/emu64.h"
@@ -318,8 +319,52 @@ extern s16 JW_JUTGamepad_getSubStickAngle() {
 static bool FrameDrawing = false;
 static bool FrameRenderedOnce = false;
 
+#ifdef TARGET_PS3
+static bool JW_IsArenaPointer(const void* ptr) {
+    uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+    uintptr_t lo = reinterpret_cast<uintptr_t>(OSGetArenaLo());
+    uintptr_t hi = reinterpret_cast<uintptr_t>(OSGetArenaHi());
+    return p != 0 && lo != 0 && hi != 0 && p >= lo && p < hi;
+}
+
+static bool JW_IsDisplayManagerSane(void* manager, const char* caller) {
+    static int diag_count = 0;
+    if (manager == nullptr) {
+        return false;
+    }
+    if (!JW_IsArenaPointer(manager)) {
+        if (diag_count < 4) {
+            OSReport("[PS3/FIX] %s: display manager outside arena mgr=%p arena=%p-%p\n",
+                     caller, manager, OSGetArenaLo(), OSGetArenaHi());
+            diag_count++;
+        }
+        return false;
+    }
+
+    void* vtable = *static_cast<void**>(manager);
+    if (diag_count < 4) {
+        OSReport("[PS3/FIX] %s: display manager=%p vtable=%p gxThread=%p cpuFifo=%p gpFifo=%p fifoBase=%p fifoSize=%u arena=%p-%p\n",
+                 caller, manager, vtable, GXGetCurrentGXThread(), GXGetCPUFifo(), GXGetGPFifo(),
+                 GXGetFifoBase(GXGetCPUFifo()), GXGetFifoSize(GXGetCPUFifo()), OSGetArenaLo(), OSGetArenaHi());
+        diag_count++;
+    }
+    if (vtable == nullptr) {
+        OSReport("[PS3/FIX] %s: display manager had null vtable; resetting singleton\n", caller);
+        return false;
+    }
+    return true;
+}
+#endif
+
 static void* JW_EnsureDisplayManager(const char* caller) {
     void* displayManager = JC_JFWDisplay_getManager();
+
+#ifdef TARGET_PS3
+    if (displayManager != nullptr && !JW_IsDisplayManagerSane(displayManager, caller)) {
+        JFWDisplay::sManager = nullptr;
+        displayManager = nullptr;
+    }
+#endif
 
     if (displayManager != nullptr) {
         return displayManager;

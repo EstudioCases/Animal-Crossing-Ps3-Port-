@@ -13,6 +13,8 @@ static u8* arena_hi = NULL;
 u8* ps3_arena_base = NULL;
 u8* ps3_arena_end  = NULL;
 
+void OSReport(const char* fmt, ...);
+
 void* OSGetArenaLo(void) { return arena_lo; }
 void* OSGetArenaHi(void) { return arena_hi; }
 void  OSSetArenaLo(void* lo) { arena_lo = (u8*)lo; }
@@ -261,6 +263,8 @@ void OSInit(void) {
 
         arena_lo = arena_memory + 0x3100;
         arena_hi = arena_memory + PS3_MAIN_MEMORY_SIZE;
+        OSReport("[PS3/OS] arena size=%u bytes lo=%p hi=%p base=%p\n",
+                 (u32)PS3_MAIN_MEMORY_SIZE, arena_lo, arena_hi, arena_memory);
     }
     time_base_start = ps3_platform_time_us();
     /* compute ticks from GC epoch (Jan 1, 2000) to now, with timezone */
@@ -346,11 +350,38 @@ void OSChangeBootMode(u32 mode) { (void)mode; }
 
 int __osResetSwitchPressed = 0;
 
-/* --- Address translation (physical addr ??? arena_memory offset) --- */
-void* OSPhysicalToCached(u32 paddr) { return (void*)(arena_memory + paddr); }
-void* OSPhysicalToUncached(u32 paddr) { return (void*)(arena_memory + paddr); }
-u32 OSCachedToPhysical(void* caddr) { return (u32)((u8*)caddr - arena_memory); }
-u32 OSUncachedToPhysical(void* ucaddr) { return (u32)((u8*)ucaddr - arena_memory); }
+/* --- Address translation (physical addr = arena_memory offset) --- */
+void* OSPhysicalToCached(u32 paddr) {
+    static int warned = 0;
+    if (!arena_memory) {
+        OSInit();
+    }
+    if (paddr >= PS3_MAIN_MEMORY_SIZE) {
+        if (!warned) {
+            OSReport("[PS3/OS] OSPhysicalToCached: OOB paddr=%08x size=%08x\n", paddr, (u32)PS3_MAIN_MEMORY_SIZE);
+            warned = 1;
+        }
+        return NULL;
+    }
+    return (void*)(arena_memory + paddr);
+}
+void* OSPhysicalToUncached(u32 paddr) { return OSPhysicalToCached(paddr); }
+u32 OSCachedToPhysical(void* caddr) {
+    static int warned = 0;
+    u8* p = (u8*)caddr;
+    if (!arena_memory || !p) {
+        return 0;
+    }
+    if (p >= arena_memory && p < arena_memory + PS3_MAIN_MEMORY_SIZE) {
+        return (u32)(p - arena_memory);
+    }
+    if (!warned) {
+        OSReport("[PS3/OS] OSCachedToPhysical: pointer outside arena %p\n", caddr);
+        warned = 1;
+    }
+    return (u32)(uintptr_t)caddr;
+}
+u32 OSUncachedToPhysical(void* ucaddr) { return OSCachedToPhysical(ucaddr); }
 void* OSCachedToUncached(void* caddr) { return caddr; }
 void* OSUncachedToCached(void* ucaddr) { return ucaddr; }
 
