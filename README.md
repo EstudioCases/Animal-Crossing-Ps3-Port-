@@ -109,6 +109,8 @@ The remaining practical order is:
 4. Iterate on the experimental full-game CMake target until it compiles and
    links with the installed SDK.
 5. Add a final full-game `.pkg` packaging target once the EBOOT is stable.
+   <img width="1534" height="503" alt="image" src="https://github.com/user-attachments/assets/52d3aa00-f45c-4c61-ad92-ff9a9d28874e" />
+
 
 ## PC Reference Build
 
