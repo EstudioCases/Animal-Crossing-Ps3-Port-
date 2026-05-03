@@ -17,6 +17,10 @@ Memory arena (48 MB) is allocated.
 Filesystem and resources are loading.
 The module /foresta.rel.szs is successfully loaded.
 Execution proceeds into game logic.
+update 03.05:
+In private, logos try to show and games shows real performance but with corrupted graphics:
+<img width="1600" height="822" alt="image" src="https://github.com/user-attachments/assets/c584f941-6964-404a-bf5a-e8773c3322ed" />
+
 
 Current Failure Point
 
