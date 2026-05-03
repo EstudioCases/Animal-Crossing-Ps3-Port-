@@ -19,7 +19,7 @@ The module /foresta.rel.szs is successfully loaded.
 Execution proceeds into game logic.
 update 03.05:
 In private, logos try to show and games shows real performance but with corrupted graphics:
-<img width="1600" height="822" alt="image" src="https://github.com/user-attachments/assets/c584f941-6964-404a-bf5a-e8773c3322ed" />
+<img width="3837" height="1960" alt="{5D20EBC0-4490-4D82-9F4B-30FFC08F64EF}" src="https://github.com/user-attachments/assets/39aa5e2f-bf7b-4872-a210-2404ddb92b5b" />
 
 
 Current Failure Point
