@@ -1,7 +1,7 @@
 # Animal Crossing GC PS3 Port
-<img width="1600" height="900" alt="image" src="https://github.com/user-attachments/assets/eecad8c4-642c-4fe0-a73e-a053c8aa61b4" />
+<img width="3840" height="2013" alt="image" src="https://github.com/user-attachments/assets/2eb54180-8b64-43d9-ab90-5439c89437e0" />
 
-Last update, late 01/05: Current Progress Status
+Last update, late 09/05: Current Progress Status
 
 Significant progress has been made.
 
@@ -17,6 +17,7 @@ Memory arena (48 MB) is allocated.
 Filesystem and resources are loading.
 The module /foresta.rel.szs is successfully loaded.
 Execution proceeds into game logic.
+new 09/05: Dualshock 3 gamepad working well, now main character partial rendering. 
 update 03.05:
 In private, logos try to show and games shows real performance but with corrupted graphics:
 <img width="3837" height="1960" alt="{5D20EBC0-4490-4D82-9F4B-30FFC08F64EF}" src="https://github.com/user-attachments/assets/39aa5e2f-bf7b-4872-a210-2404ddb92b5b" />
