@@ -23,14 +23,11 @@ In private, logos try to show and games shows real performance but with corrupte
 <img width="3837" height="1960" alt="{5D20EBC0-4490-4D82-9F4B-30FFC08F64EF}" src="https://github.com/user-attachments/assets/39aa5e2f-bf7b-4872-a210-2404ddb92b5b" />
 
 
-Current Failure Point
+Current Progress Update
 
-The crash now occurs after loading the REL module (foresta.rel.szs), during execution of module-related code.
-
-This indicates:
-The core engine is now running correctly.
-The failure is happening in dynamic module handling, not base systems.
-New update 01/05/2026 the game dead in the second frame, but is booting on ps3 real hardware and in the RPCS3 EMU. 
+- REL module loading issue fixed: `boot.c` now guards dynamic PowerPC REL module loading (`LoadLink("/foresta.rel.szs")`) for `TARGET_PS3`, as actor/game code is statically compiled into the executable binary target (aligning with `TARGET_PC`).
+- Actor initialization safeguards: Added `TARGET_PS3` bounds checks and null profile fallback in `m_actor.c`.
+- Single-threaded frame loop & exit handling: Updated `graph.c` and `main.c` to gracefully drive single-threaded frame updates and monitor `g_ps3_running` state.
 Work-in-progress PS3 homebrew port of Animal Crossing (GameCube), based on the
 existing decompilation and native port work.
 

@@ -461,8 +461,8 @@ extern void graph_proc(void* arg) {
         GRAPH_SET_DOING_POINT(__graph, GAME_DT_FINISHED);
         free(game);
         game_class_p = NULL;
-#ifdef TARGET_PC
-        if (!g_pc_running) break;
+#if defined(TARGET_PC) || defined(TARGET_PS3)
+        if (!g_pc_running || !g_ps3_running) break;
 #endif
     }
 

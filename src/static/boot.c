@@ -779,8 +779,8 @@ int main(int argc, const char** argv) {
 #endif
   LoadStringTable("/static.str");
 
-#ifdef TARGET_PC
-  OSReport("[PC] boot: skipping REL module load (code is statically linked)\n");
+#if defined(TARGET_PC) || defined(TARGET_PS3)
+  OSReport("[PORT] boot: skipping REL module load (code is statically linked)\n");
   moduleA = (OSModuleHeader*)1;  /* non-null sentinel - code is statically linked */
 #else
   OSReport("モジュール(%s)の読み込み中\n", "/foresta.rel.szs");
@@ -806,8 +806,8 @@ int main(int argc, const char** argv) {
     HotStartEntry = (*(void* (*)())HotStartEntry)();
   }
 
-#ifdef TARGET_PC
-  /* No REL module to unlink on PC - code is statically linked */
+#if defined(TARGET_PC) || defined(TARGET_PS3)
+  /* No REL module to unlink on PC/PS3 - code is statically linked */
   moduleA = nullptr;
 #else
   UnLink(moduleA);
